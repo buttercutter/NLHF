@@ -56,6 +56,7 @@ def print_tensor_info(tensor_name, tensor):
 # Adjusting eta affects the balance between exploiting the current policy
 # and exploring new policies suggested by the reference model or feedback.
 eta = 0.5
+tau = 1 - eta
 
 
 """
@@ -236,13 +237,12 @@ def preference_model(state, state_action_a, state_action_b, mask_a, mask_b,
         reference_policy_probs_b = reference_model(state_action_b, mask_b)
 
     # Calculate model confidences using both current and reference models
-    # log(sigmoid(delta_reward)) is better, since delta_reward is clamped
+    # sigmoid(delta_reward) is better, since delta_reward is clamped
     # to [0.0-1.0] with sigmoid
-    # and log(x) makes x more stable if we want to train over it
-    model_confidence_a = torch.log(torch.sigmoid(current_policy_probs_a -
-                                                reference_policy_probs_a))
-    model_confidence_b = torch.log(torch.sigmoid(current_policy_probs_b -
-                                                reference_policy_probs_b))
+    model_confidence_a = torch.sigmoid(current_policy_probs_a -
+                                       reference_policy_probs_a)
+    model_confidence_b = torch.sigmoid(current_policy_probs_b -
+                                       reference_policy_probs_b)
     # model_confidence_a = current_policy_probs_a - reference_policy_probs_a
     # model_confidence_b = current_policy_probs_b - reference_policy_probs_b
 
@@ -250,6 +250,9 @@ def preference_model(state, state_action_a, state_action_b, mask_a, mask_b,
     # human preference
     preference_score_a = model_confidence_a * human_preferences
     preference_score_b = model_confidence_b * human_preferences
+
+    assert preference_score_a >= 0
+    assert preference_score_b >= 0
 
     # Compare and return the preferred action's score
     if preference_score_a > preference_score_b:
@@ -260,7 +263,8 @@ def preference_model(state, state_action_a, state_action_b, mask_a, mask_b,
     # Subtract the baseline (average preference score) for variance reduction
     # to reduce the variance of the policy gradient estimate, which can help
     # stabilize training
-    baseline = preference_score.mean()
+    # we do not use preference_score.mean(), see equation (9) in NLHF paper
+    baseline = 0.0
     return preference_score - baseline
 
 
@@ -772,7 +776,7 @@ if USE_ADAMW_ON_LION:
 
                 scaled_updates = []
                 for lion_update, adamW_update in zip(lion_updates, adamW_updates):
-                    # Implement your scaling logic with individual 'lion_update' and 'adamw_update'
+                    # Implement scaling logic with individual 'lion_update' and 'adamw_update'
 
                     # See [Learning Rate Grafting Transferability of Optimizer Tuning]
                     # (https://openreview.net/forum?id=FpKgG31Z_i9)
@@ -851,27 +855,151 @@ for epoch in tqdm(range(num_epochs)):  # loop over the dataset multiple times
         # Initialize a dictionary to store updated policies for each action
         updated_policies = {}
 
-        state_action_space = [state_action_a, state_action_b]
+        """
+        See Section 7.1 of the NLHF paper.
 
-        # Calculate preference score and perform Nash-MD update
-        for state_action in state_action_space:
-            # Get the action probabilities from the current policy
-            current_policy_prob = current_policy(state_action, mask_a)
-            reference_policy_prob = reference_policy(state_action, mask_b)
-            # print(f"current_policy_prob = {current_policy_prob}")
-            # print(f"reference_policy_prob = {reference_policy_prob}")
+        The current policy response and the alternative policy response are
+        generated token by token. For the alternative policy, the marginal
+        geometric mixture is computed for each token based on the current
+        policy probabilities and the reference policy probabilities.
+        The alternative token is then sampled from this marginal mixture
+        probability distribution.
+
+        In the context of language models, generating responses often
+        involves an autoregressive process where tokens are generated
+        sequentially, conditioned on the previous tokens. The
+        one-step-at-a-time regularized policy addresses this scenario
+        by generating the alternative response token by token, rather
+        than generating the entire response at once.
+
+        The key idea behind the one-step-at-a-time regularized policy is
+        to use a marginal geometric mixture of the current policy and the
+        reference policy for each token generation step. This means that
+        at each step, the probability distribution over the next token is
+        computed as a geometric mixture of the probabilities assigned by
+        the current policy and the reference policy.
+
+        Mathematically, for each token position 𝑛, the marginal geometric
+        mixture is defined as:
+
+        log ˜𝜋𝜏_𝜃(𝑦_𝑛 | 𝑥, 𝑦_0:𝑛−1) = 𝜏 log 𝜋_𝜃(𝑦_𝑛 | 𝑥, 𝑦_0:𝑛−1) +
+                                      (1 − 𝜏) log 𝜇(𝑦_𝑛 | 𝑥, 𝑦_0:𝑛−1) +
+                                      𝐶(𝑥, 𝑦_0:𝑛−1)
+
+        Here, ˜𝜋𝜏_𝜃 represents the one-step-at-a-time regularized policy,
+        𝜋_𝜃 is the current policy, 𝜇 is the reference policy,
+        𝜏 is the mixing coefficient, and
+        𝐶(𝑥, 𝑦_0:𝑛−1) is a normalization constant that depends on the
+        context 𝑥 and the generated tokens up to position 𝑛−1.
+
+        To sample from this marginal geometric mixture, the logits of
+        both the current policy and the reference policy are evaluated,
+        conditioned on the context and the previously generated tokens.
+        The logits are then combined using an arithmetic mixture
+        weighted by 𝜏, and the next token is sampled from the resulting
+        softmax distribution.
+
+        The one-step-at-a-time regularized policy has a few important
+        implications:
+
+        - It allows for a more fine-grained control over the generation
+          process, as the mixture between the current policy and the
+          reference policy is applied at each token generation step.
+        - It provides a way to incorporate the reference policy's
+          influence throughout the generation process, rather than just
+          at the beginning.
+        - The normalization constant 𝐶(𝑥, 𝑦_0:𝑛−1) ensures that the
+          resulting probability distribution over tokens is properly
+          normalized at each step.
+
+        However, it's important to note that the one-step-at-a-time
+        regularized policy is an approximation to the full regularized
+        policy defined in the paper. The full regularized policy would
+        involve a geometric mixture over the entire sequence of tokens,
+        which can be computationally challenging to compute and sample
+        from directly.
+
+        Implementing the one-step-at-a-time regularized policy in the
+        Nash-MD algorithm requires modifying the response generation
+        process to generate tokens sequentially and computing the
+        marginal geometric mixture at each step. This allows for a
+        more faithful implementation of the regularized policy while
+        still being computationally tractable.
+
+        Credit: Claude-3-Opus-200k AI chatbot
+        """
+
+        """
+        To generate the alternative policy response, we follow a
+        similar process but with a key difference. We initialize
+        an empty list alternative_response and create a copy of
+        the state_action tensor called alternative_state_action.
+        Then, for each token generation step:
+        - We obtain the current policy probabilities using
+          current_policy(current_state_action, mask).
+        - We obtain the reference policy probabilities using
+          reference_policy(alternative_state_action, mask).
+        - We compute the marginal geometric mixture of the current
+          policy probabilities and reference policy probabilities
+          using the formula:
+            log_marginal_mixture =
+                    tau * torch.log(current_policy_prob) +
+                    (1 - tau) * torch.log(reference_policy_prob).
+        - We sample a token from the marginal mixture probabilities
+          using torch.multinomial() and append it to
+          alternative_response.
+        - We update alternative_state_action by concatenating the
+          generated token to it, which will be used as input for
+          the next token generation step.
+        """
+
+        # Calculate the average response length in the dataset
+        response_lengths = [len(entry['human_ref_A'].split()) + len(entry['human_ref_B'].split())
+                            for entry in dataset['train']]
+        avg_response_length = sum(response_lengths) / len(response_lengths)
+
+        # Set max_response_length to a value slightly higher than the average
+        max_response_length = int(avg_response_length * 1.2)
+
+        # A list of state_action pairs
+        state_action_space = []
+
+        # Generate current policy response token by token
+        current_state_action = state_action_a  # Use state_action_a as the initial state-action pair for the current policy
+        current_response = []
+
+        # Generate alternative policy response token by token
+        alternative_state_action = state_action_b  # Use state_action_b as the initial state-action pair for the alternative policy
+        alternative_response = []
+
+        for _ in range(max_response_length):
+            current_policy_prob = current_policy(current_state_action)
+            reference_policy_prob = reference_policy(alternative_state_action)
+
+            current_token = torch.multinomial(current_policy_prob, num_samples=1)
+            current_response.append(current_token)
+            current_state_action = torch.cat((current_token, current_state_action[:, 1:]), dim=1)
+
+            log_marginal_mixture = tau * torch.log(current_policy_prob) + (1 - tau) * torch.log(reference_policy_prob)
+            marginal_mixture_prob = torch.exp(log_marginal_mixture)
+
+            alternative_token = torch.multinomial(marginal_mixture_prob, num_samples=1)
+            alternative_response.append(alternative_token)
+            alternative_state_action = torch.cat((alternative_token, alternative_state_action[:, 1:]), dim=1)
+            state_action_space.append(alternative_state_action)
 
             # Calculate the preference score
             preference_score = preference_model(
                                    state,
-                                   state_action_a,
-                                   state_action_b,
-                                   mask_a,
-                                   mask_b,
+                                   current_state_action,  # state_action_a,
+                                   alternative_state_action,  # state_action_b,
+                                   None,  # mask_a,
+                                   None,  # mask_b,
                                    current_policy,
                                    reference_policy,
                                    human_preferences
                                )
+            print(f"preference_score = {preference_score}")
 
             # Perform Nash-MD update, see equations (5) or (11) in NLHF paper
             updated_policy_prob = \
@@ -882,7 +1010,7 @@ for epoch in tqdm(range(num_epochs)):  # loop over the dataset multiple times
             updated_policy_prob = torch.exp(updated_policy_prob)
 
             # Store the updated policy probability for the action
-            updated_policies[state_action] = updated_policy_prob
+            updated_policies[alternative_state_action] = updated_policy_prob
 
         """
         See section 7 of the paper
@@ -895,12 +1023,13 @@ for epoch in tqdm(range(num_epochs)):  # loop over the dataset multiple times
         sum of probabilities across all possible actions y equals 1.
         """
         # Normalize the updated policies
-        normalization_constant = sum(updated_policies.values())
-        print_tensor_info("normalization_constant", normalization_constant)
+        log_updated_policies = [torch.log(prob) for prob in updated_policies.values()]
+        log_normalization_constant = torch.logsumexp(torch.stack(log_updated_policies), dim=0)
 
-        updated_policies_normalized = \
-            {action: prob / normalization_constant
-                for action, prob in updated_policies.items()}
+        print_tensor_info("log_normalization_constant", log_normalization_constant)
+
+        log_updated_policies_normalized = \
+            [log_prob - log_normalization_constant for log_prob in log_updated_policies]
 
         """
         Theorem 1 in the paper is related to the convergence properties of the
@@ -942,16 +1071,14 @@ for epoch in tqdm(range(num_epochs)):  # loop over the dataset multiple times
         )
         """
 
-        # Calculate the loss for backpropagation
-        loss = -torch.sum(torch.stack(
-                    [torch.log(updated_policies_normalized[state_action])
-                        for state_action in state_action_space]))
+        # Calculate cross-entropy loss for backpropagation as in section 8.1
+        loss = -torch.sum(torch.stack(log_updated_policies_normalized))
 
         # Perform backpropagation
         loss.backward(retain_graph=True)
 
         # Clip gradients: gradients are modified in place
-        max_grad_norm = 10.0
+        max_grad_norm = 1.5
         for model in [current_policy, reference_policy]:
             # torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
             for name, param in model.named_parameters():
