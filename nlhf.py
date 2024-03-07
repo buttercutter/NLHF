@@ -32,7 +32,7 @@ batch_size = 16
 
 
 torch.autograd.set_detect_anomaly(True)
-debugging_is_on = 0
+debugging_is_on = 1
 
 
 def print_tensor_info(tensor_name, tensor):
@@ -166,7 +166,8 @@ elif USE_NLP:
             score = self.final_layer(text_embeddings)
 
             # for numerical stability
-            score = self.relu(score) + 1e-6
+            # score = self.relu(score) + 1e-6
+            score = torch.sigmoid(score)
 
             return score
 
@@ -251,8 +252,10 @@ def preference_model(state, state_action_a, state_action_b, mask_a, mask_b,
     preference_score_a = model_confidence_a * human_preferences
     preference_score_b = model_confidence_b * human_preferences
 
-    assert preference_score_a >= 0
-    assert preference_score_b >= 0
+    assert preference_score_a.min() >= 0
+    assert preference_score_b.min() >= 0
+    assert preference_score_a.max() <= 1
+    assert preference_score_b.max() <= 1
 
     # Compare and return the preferred action's score
     if preference_score_a > preference_score_b:
@@ -264,7 +267,7 @@ def preference_model(state, state_action_a, state_action_b, mask_a, mask_b,
     # to reduce the variance of the policy gradient estimate, which can help
     # stabilize training
     # we do not use preference_score.mean(), see equation (9) in NLHF paper
-    baseline = 0.0
+    baseline = 0.5
     return preference_score - baseline
 
 
@@ -584,7 +587,7 @@ if USE_ADAMW_ON_LION:
                     state = self.state[p]
                     # State initialization
                     if len(state) == 0:
-                        print("len(state) == 0:")
+                        # print("len(state) == 0:")
                         # Exponential moving average of gradient values
                         state['exp_avg'] = torch.zeros_like(p)
 
@@ -788,8 +791,8 @@ if USE_ADAMW_ON_LION:
 
                     scaled_updates.append(scaled_update)
 
-                    print(f"i = {i} , lion_update = {lion_update} , adamW_update = {adamW_update}, \
-                          scaled_update = {scaled_update}")
+                    # print(f"i = {i} , lion_update = {lion_update} , adamW_update = {adamW_update}, \
+                    #      scaled_update = {scaled_update}")
 
                 # Update model weights
                 for param, update in zip(self.params, scaled_updates):
@@ -976,6 +979,11 @@ for epoch in tqdm(range(num_epochs)):  # loop over the dataset multiple times
             current_policy_prob = current_policy(current_state_action)
             reference_policy_prob = reference_policy(alternative_state_action)
 
+            assert current_policy_prob >= 0
+            assert current_policy_prob <= 1
+            assert reference_policy_prob >= 0
+            assert reference_policy_prob <= 1
+
             current_token = torch.multinomial(current_policy_prob, num_samples=1)
             current_response.append(current_token)
             current_state_action = torch.cat((current_token, current_state_action[:, 1:]), dim=1)
@@ -999,7 +1007,9 @@ for epoch in tqdm(range(num_epochs)):  # loop over the dataset multiple times
                                    reference_policy,
                                    human_preferences
                                )
-            print(f"preference_score = {preference_score}")
+            # print(f"preference_score = {preference_score}")
+            # assert preference_score.min() >= 0
+            assert preference_score.max() <= 1
 
             # Perform Nash-MD update, see equations (5) or (11) in NLHF paper
             updated_policy_prob = \
@@ -1008,6 +1018,8 @@ for epoch in tqdm(range(num_epochs)):  # loop over the dataset multiple times
                 eta * preference_score
 
             updated_policy_prob = torch.exp(updated_policy_prob)
+            assert updated_policy_prob >= 0
+            assert updated_policy_prob <= 1
 
             # Store the updated policy probability for the action
             updated_policies[alternative_state_action] = updated_policy_prob
@@ -1025,11 +1037,12 @@ for epoch in tqdm(range(num_epochs)):  # loop over the dataset multiple times
         # Normalize the updated policies
         log_updated_policies = [torch.log(prob) for prob in updated_policies.values()]
         log_normalization_constant = torch.logsumexp(torch.stack(log_updated_policies), dim=0)
-
-        print_tensor_info("log_normalization_constant", log_normalization_constant)
+        # assert log_normalization_constant <= 0
 
         log_updated_policies_normalized = \
             [log_prob - log_normalization_constant for log_prob in log_updated_policies]
+
+        assert max(log_updated_policies_normalized) <= 0  # prob <= 1, so log(prob) <= 0
 
         """
         Theorem 1 in the paper is related to the convergence properties of the
@@ -1074,6 +1087,10 @@ for epoch in tqdm(range(num_epochs)):  # loop over the dataset multiple times
         # Calculate cross-entropy loss for backpropagation as in section 8.1
         loss = -torch.sum(torch.stack(log_updated_policies_normalized))
 
+        # Calculate MSE loss for backpropagation as in section 8.1
+        # loss = torch.mean((torch.stack(log_updated_policies_normalized) - \
+        #                    torch.log(normalized_preference_scores)) ** 2)
+
         # Perform backpropagation
         loss.backward(retain_graph=True)
 
@@ -1089,7 +1106,10 @@ for epoch in tqdm(range(num_epochs)):  # loop over the dataset multiple times
 
         if debugging_is_on:
             print("DEBUGGING IS ON !!!")
-            print_tensor_info("normalization_constant", normalization_constant)
+            # print_tensor_info("log_normalization_constant", log_normalization_constant)
+
+            # for log_policy_norm in log_updated_policies_normalized:
+                # print_tensor_info("log_updated_policies_normalized", log_policy_norm)
 
             for model in [current_policy, reference_policy]:
                 for name, parameter in model.named_parameters():
