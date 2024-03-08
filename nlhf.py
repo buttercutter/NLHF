@@ -260,15 +260,27 @@ def preference_model(state, state_action_a, state_action_b, mask_a, mask_b,
     # Compare and return the preferred action's score
     if preference_score_a > preference_score_b:
         preference_score = preference_score_a
+
+        current_policy_prob = current_policy_probs_a
+        reference_policy_prob = reference_policy_probs_a
+
     else:
         preference_score = preference_score_b
+
+        current_policy_prob = current_policy_probs_b
+        reference_policy_prob = reference_policy_probs_b
+
+    # See equation (9)
+    # KL divergence regularization term helps to prevent the current policy
+    # from diverging too much from the reference policy during the optimization
+    kl_regularization = tau * torch.log(current_policy_prob / reference_policy_prob)
 
     # Subtract the baseline (average preference score) for variance reduction
     # to reduce the variance of the policy gradient estimate, which can help
     # stabilize training
     # we do not use preference_score.mean(), see equation (9) in NLHF paper
     baseline = 0.5
-    return preference_score - baseline
+    return preference_score - baseline - kl_regularization
 
 
 # Dataset selection
