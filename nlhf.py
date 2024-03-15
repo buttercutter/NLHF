@@ -32,7 +32,7 @@ batch_size = 16
 
 
 torch.autograd.set_detect_anomaly(True)
-debugging_is_on = 1
+debugging_is_on = False
 
 
 def print_tensor_info(tensor_name, tensor):
@@ -280,10 +280,18 @@ def preference_model(state, state_action_a, state_action_b, mask_a, mask_b,
         reference_policy_probs_a = reference_model(state_action_a, mask_a)
         reference_policy_probs_b = reference_model(state_action_b, mask_b)
 
+
+    # Calculate the log probability of the current policy 𝜋𝜃
     log_current_prob_a = torch.log(current_policy_probs_a)
     log_current_prob_b = torch.log(current_policy_probs_b)
+
+    # Calculate the log probability of the reference policy 𝜇
     log_reference_prob_a = torch.log(reference_policy_probs_a)
     log_reference_prob_b = torch.log(reference_policy_probs_b)
+
+    # Calculate the cross-entropy loss for the current policy
+    current_loss_a = -torch.log(current_policy_probs_a)
+    current_loss_b = -torch.log(current_policy_probs_b)
 
     # See equation (9)
     # KL divergence regularization term helps to prevent the current policy
@@ -331,8 +339,8 @@ def preference_model(state, state_action_a, state_action_b, mask_a, mask_b,
     """
 
     # Initialize the gradient term for the current policy 𝜋𝜃 using equation (9)
-    current_gradient_term_a = torch.zeros_like(log_current_prob_a)
-    current_gradient_term_b = torch.zeros_like(log_current_prob_b)
+    # current_gradient_term_a = torch.zeros_like(log_current_prob_a)
+    # current_gradient_term_b = torch.zeros_like(log_current_prob_b)
 
     current_kl_estimator_a = None
     current_kl_estimator_b = None
@@ -349,14 +357,16 @@ def preference_model(state, state_action_a, state_action_b, mask_a, mask_b,
         Credit: Quoted directly from section 7.2 of NLHF paper
         """
         # Calculate the gradient term using equation (9)
-        current_gradient_term_a[:, n] = torch.autograd.grad(log_current_prob_a[:, n], model.parameters(), retain_graph=True)[0]
-        current_gradient_term_b[:, n] = torch.autograd.grad(log_current_prob_b[:, n], model.parameters(), retain_graph=True)[0]
+        # Realized that gradient term may not needed after all since both
+        # equations (9) and (10) are implicitly realized within autograd engine.
+        # current_gradient_term_a[:, n] = torch.autograd.grad(log_current_prob_a[:, n], model.parameters(), retain_graph=True)[0]
+        # current_gradient_term_b[:, n] = torch.autograd.grad(log_current_prob_b[:, n], model.parameters(), retain_graph=True)[0]
 
         # Apply the variance-reduction trick
         current_kl_estimator_a = torch.sum(current_kl_divergence_a[:, n:], dim=1)
         current_kl_estimator_b = torch.sum(current_kl_divergence_b[:, n:], dim=1)
-        current_gradient_term_a[:, n] *= current_kl_estimator_a
-        current_gradient_term_b[:, n] *= current_kl_estimator_b
+        # current_gradient_term_a[:, n] *= current_kl_estimator_a
+        # current_gradient_term_b[:, n] *= current_kl_estimator_b
 
 
     # Calculate the preference loss using equation (9)
@@ -383,9 +393,12 @@ def preference_model(state, state_action_a, state_action_b, mask_a, mask_b,
     '''
     baseline = 0.5
 
-    # Calculate the expectation over states and actions using equation (10)
-    preference_loss = torch.mean((human_preferences - baseline - tau * current_kl_estimator_a) * current_gradient_term_a -
-                                 ((1 - human_preferences) - baseline - tau * current_kl_estimator_b) * current_gradient_term_b)
+    # Calculate the preference loss using the cross-entropy losses as well as
+    # the expectation over states and actions using equation (10)
+    # preference_loss = torch.mean(((human_preferences - baseline - tau * current_kl_estimator_a) * current_gradient_term_a +
+    #                              ((1 - human_preferences) - baseline - tau * current_kl_estimator_b) * current_gradient_term_b)) / 2)
+    current_preference_loss = torch.mean(((human_preferences - baseline - tau * current_kl_estimator_a) * current_loss_a +
+                                 ((1 - human_preferences) - baseline - tau * current_kl_estimator_b) * current_loss_b) / 2)
 
 
     # Calculate the alternative policy 𝜋′ for state-action pairs (a) and (b) using equation (11)
@@ -396,6 +409,10 @@ def preference_model(state, state_action_a, state_action_b, mask_a, mask_b,
     log_alternative_prob_a = torch.log(alternative_policy_prob_a)
     log_alternative_prob_b = torch.log(alternative_policy_prob_b)
 
+    # Calculate the cross-entropy loss for the alternative policy
+    alternative_loss_a = -torch.log(alternative_policy_prob_a)
+    alternative_loss_b = -torch.log(alternative_policy_prob_b)
+
     # See equation (9)
     # KL divergence regularization term helps to prevent the alternative policy
     # from diverging too much from the reference policy during the optimization
@@ -404,8 +421,8 @@ def preference_model(state, state_action_a, state_action_b, mask_a, mask_b,
     alternative_kl_divergence_b = log_alternative_prob_b - log_reference_prob_b
 
     # Initialize the gradient term for the alternative policy 𝜋′ using equation (9)
-    alternative_gradient_term_a = torch.zeros_like(log_alternative_prob_a)
-    alternative_gradient_term_b = torch.zeros_like(log_alternative_prob_b)
+    # alternative_gradient_term_a = torch.zeros_like(log_alternative_prob_a)
+    # alternative_gradient_term_b = torch.zeros_like(log_alternative_prob_b)
 
     alternative_kl_estimator_a = None
     alternative_kl_estimator_b = None
@@ -422,23 +439,29 @@ def preference_model(state, state_action_a, state_action_b, mask_a, mask_b,
         Credit: Quoted directly from section 7.2 of NLHF paper
         """
         # Calculate the gradient term using equation (9)
-        alternative_gradient_term_a[:, n] = torch.autograd.grad(log_alternative_prob_a[:, n], model.parameters(), retain_graph=True)[0]
-        alternative_gradient_term_b[:, n] = torch.autograd.grad(log_alternative_prob_b[:, n], model.parameters(), retain_graph=True)[0]
+        # Realized that gradient term may not needed after all since both
+        # equations (9) and (10) are implicitly realized within autograd engine.
+        # alternative_gradient_term_a[:, n] = torch.autograd.grad(log_alternative_prob_a[:, n], model.parameters(), retain_graph=True)[0]
+        # alternative_gradient_term_b[:, n] = torch.autograd.grad(log_alternative_prob_b[:, n], model.parameters(), retain_graph=True)[0]
 
         # Apply the variance-reduction trick
         alternative_kl_estimator_a = torch.sum(alternative_kl_divergence_a[:, n:], dim=1)
         alternative_kl_estimator_b = torch.sum(alternative_kl_divergence_b[:, n:], dim=1)
-        alternative_gradient_term_a[:, n] *= alternative_kl_estimator_a
-        alternative_gradient_term_b[:, n] *= alternative_kl_estimator_b
+        # alternative_gradient_term_a[:, n] *= alternative_kl_estimator_a
+        # alternative_gradient_term_b[:, n] *= alternative_kl_estimator_b
 
 
-    alternative_preference_loss = torch.mean((human_preferences - baseline - tau * alternative_kl_estimator_a) * alternative_gradient_term_a -
-                                             ((1 - human_preferences) - baseline - tau * alternative_kl_estimator_b) * alternative_gradient_term_b)
+    # Calculate the preference loss using the cross-entropy losses as well as
+    # the expectation over states and actions using equation (10)
+    # alternative_preference_loss = torch.mean(((human_preferences - baseline - tau * alternative_kl_estimator_a) * alternative_gradient_term_a +
+    #                                          ((1 - human_preferences) - baseline - tau * alternative_kl_estimator_b) * alternative_gradient_term_b)) / 2)
+    alternative_preference_loss = torch.mean(((human_preferences - baseline - tau * alternative_kl_estimator_a) * alternative_loss_a +
+                                             ((1 - human_preferences) - baseline - tau * alternative_kl_estimator_b) * alternative_loss_b) / 2)
 
-    assert preference_loss.max() <= 1
+    assert current_preference_loss.max() <= 1
     assert alternative_preference_loss.max() <= 1
 
-    return preference_loss, alternative_preference_loss
+    return current_preference_loss, alternative_preference_loss
 
 
 # Dataset selection
@@ -734,7 +757,7 @@ if USE_ADAMW_ON_LION:
             for group in self.param_groups:
                 for p in group['params']:
                     if p.grad is None:
-                        print("p.grad is None")
+                        # print("p.grad is None")
                         continue
 
                     # Perform stepweight decay
@@ -827,6 +850,7 @@ if USE_ADAMW_ON_LION:
             for group in self.param_groups:
                 for p in group['params']:
                     if p.grad is None:
+                        # print("p.grad is None")
                         continue
                     grad = p.grad.data
                     if grad.is_sparse:
@@ -993,10 +1017,8 @@ for epoch in tqdm(range(num_epochs)):  # loop over the dataset multiple times
         learning_rate is the learning rate η.
     """
 
-    # Assuming these are defined:
     # current_policy: current policy network
     # reference_policy: reference policy network
-    # model: the model being trained
     # state: current state from the environment
 
     total_loss = 0  # this variable is only valid for one epoch
@@ -1141,15 +1163,15 @@ for epoch in tqdm(range(num_epochs)):  # loop over the dataset multiple times
             current_state_action = torch.cat((current_token, current_state_action[:, 1:]), dim=1)
 
             log_marginal_mixture = tau * torch.log(current_policy_prob) + (1 - tau) * torch.log(reference_policy_prob)
-            marginal_mixture_prob = torch.exp(log_marginal_mixture)
+            alternative_policy_prob = torch.exp(log_marginal_mixture)
 
-            alternative_token = torch.multinomial(marginal_mixture_prob, num_samples=1)
+            alternative_token = torch.multinomial(alternative_policy_prob, num_samples=1)
             alternative_response.append(alternative_token)
             alternative_state_action = torch.cat((alternative_token, alternative_state_action[:, 1:]), dim=1)
 
 
             # Calculate the preference losses
-            preference_loss, alternative_preference_loss = preference_model(
+            current_preference_loss, alternative_preference_loss = preference_model(
                                    state,
                                    current_state_action,  # state_action_a,
                                    alternative_state_action,  # state_action_b,
@@ -1160,9 +1182,12 @@ for epoch in tqdm(range(num_epochs)):  # loop over the dataset multiple times
                                    human_preferences
                                )
 
-            # For each token, calculates cross-entropy loss for backpropagation as in section 8.1
-            # using the `combined_loss` variable
-            combined_loss += alpha * preference_loss + (1 - alpha) * alternative_preference_loss
+            # Calculate the combined loss for the current token by linearly combining the
+            # preference losses for both the current policy and the alternative policy
+            token_combined_loss = alpha * current_preference_loss + (1 - alpha) * alternative_preference_loss
+
+            # Accumulate the combined loss for the current token
+            combined_loss += token_combined_loss
 
         # Calculate the average combined loss across all tokens
         combined_loss /= max_response_length
@@ -1222,10 +1247,6 @@ for epoch in tqdm(range(num_epochs)):  # loop over the dataset multiple times
 
         if debugging_is_on:
             print("DEBUGGING IS ON !!!")
-            # print_tensor_info("log_normalization_constant", log_normalization_constant)
-
-            # for log_policy_norm in log_updated_policies_normalized:
-                # print_tensor_info("log_updated_policies_normalized", log_policy_norm)
 
             for model in [current_policy, reference_policy]:
                 for name, parameter in model.named_parameters():
@@ -1238,12 +1259,12 @@ for epoch in tqdm(range(num_epochs)):  # loop over the dataset multiple times
         optimizer_current_policy.step()
         optimizer_reference_policy.step()
 
-        total_loss += loss.item()
+        total_loss += combined_loss.item()
 
     train_loss = total_loss / len(train_loader)
 
     if not train_loss >= 0:
         print("non-positive training loss !!!")
-        debugging_is_on = 1
+        debugging_is_on = True
 
     print(f'Epoch: {epoch+1}, Training Loss: {train_loss:.4f}')
