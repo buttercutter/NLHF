@@ -53,10 +53,13 @@ def print_tensor_info(tensor_name, tensor):
         print(f"{key}: {value}")
 
 
-# Adjusting eta affects the balance between exploiting the current policy
+# Adjusting beta affects the balance between exploiting the current policy
 # and exploring new policies suggested by the reference model or feedback.
-eta = 0.5
-tau = 1 - eta
+beta = 0.5
+tau = 1 - beta
+
+# alpha is the weight on how to linearly combine the preference losses
+alpha = 0.5
 
 
 """
@@ -199,6 +202,43 @@ See also expression (1.1), section 4 and Theorem 1 of
 (https://arxiv.org/abs/2402.00742)
 """
 
+def alternative_policy(current_policy_probs, reference_policy_probs):
+    # Calculate the alternative policy 𝜋′ using equation (11)
+    log_alternative_policy_prob = (1 - beta) * torch.log(current_policy_probs) + \
+                                beta * torch.log(reference_policy_probs)
+
+    alternative_policy_prob = torch.exp(log_alternative_policy_prob)
+
+    """
+    See section 7 of the paper
+
+    In equation (11), the normalization constant c is indeed important.
+    It ensures that after updating the policy using the Nash-MD-PG algorithm,
+    the updated policy π is still a valid probability distribution.
+
+    The constant c is determined after the update so that the
+    sum of probabilities across all possible actions y equals 1.
+    """
+    # Normalize the alternative policy 𝜋′ using equation (11)
+    alternative_policy_prob = alternative_policy_prob / alternative_policy_prob.sum(dim=-1, keepdim=True)
+
+    """
+    The following needs some pondering and may need to be revisited.
+
+    Notice that the one-step-at-a-time regularized policy 𝜋𝜏 𝜃(𝑦|𝑥)
+    is different from the original regularized policy 𝜋𝜏 𝜃(𝑦|𝑥)
+    because the sequence of normalization constants 𝐶(𝑥, 𝑦0:𝑛−1)
+    depend on the specific sample path 𝑦0:𝑛−1 and does not necessarily
+    correspond to the full normalization constant 𝑐 defined in Equation (5).
+
+    Credit: Quoted directly from section 7.1 of NLHF paper
+    """
+
+    assert alternative_policy_prob >= 0
+    assert alternative_policy_prob <= 1
+
+    return alternative_policy_prob
+
 
 def preference_model(state, state_action_a, state_action_b, mask_a, mask_b,
                      model, reference_model, human_preferences):
@@ -206,14 +246,16 @@ def preference_model(state, state_action_a, state_action_b, mask_a, mask_b,
     A model that scores actions based on a combination of model predictions
     and human preferences.
 
-    :param state: The current state from the environment.
-    :param action: The action taken by the policy.
-    :param mask: attention mask due to the use of padding
-    :param model: The current policy model.
-    :param reference_model: The reference policy model.
-    :param human_preferences: A dictionary mapping state-action pairs to
-                              human preference scores.
-    :return: A preference score for the action.
+    Args:
+        state (tensor): The current state from the environment
+        state_action_a (tensor): The state-action pair A.
+        state_action_b (tensor): The state-action pair B.
+        mask: attention mask due to the use of padding
+        model (nn.Module): The current model 𝜋𝜃(𝑦|𝑥)).
+        reference_model (nn.Module): The reference model 𝜇(𝑦|𝑥).
+        human_preferences (tensor): The human preferences.
+
+    return: Preference losses for actions from current policy and alternative policy
     """
 
     # Use float32 since the models internal compute ops are floating-point
@@ -221,6 +263,7 @@ def preference_model(state, state_action_a, state_action_b, mask_a, mask_b,
 
     if USE_MAMBA:
         # Get the current policy's probability distribution for actions
+        # Sample actions from the current policy 𝜋𝜃
         current_policy_probs_a = model(state_action_a)
         current_policy_probs_b = model(state_action_b)
 
@@ -237,50 +280,165 @@ def preference_model(state, state_action_a, state_action_b, mask_a, mask_b,
         reference_policy_probs_a = reference_model(state_action_a, mask_a)
         reference_policy_probs_b = reference_model(state_action_b, mask_b)
 
-    # Calculate model confidences using both current and reference models
-    # sigmoid(delta_reward) is better, since delta_reward is clamped
-    # to [0.0-1.0] with sigmoid
-    model_confidence_a = torch.sigmoid(current_policy_probs_a -
-                                       reference_policy_probs_a)
-    model_confidence_b = torch.sigmoid(current_policy_probs_b -
-                                       reference_policy_probs_b)
-    # model_confidence_a = current_policy_probs_a - reference_policy_probs_a
-    # model_confidence_b = current_policy_probs_b - reference_policy_probs_b
-
-    # Calculate the preference score by combining model confidence and
-    # human preference
-    preference_score_a = model_confidence_a * human_preferences
-    preference_score_b = model_confidence_b * human_preferences
-
-    assert preference_score_a.min() >= 0
-    assert preference_score_b.min() >= 0
-    assert preference_score_a.max() <= 1
-    assert preference_score_b.max() <= 1
-
-    # Compare and return the preferred action's score
-    if preference_score_a > preference_score_b:
-        preference_score = preference_score_a
-
-        current_policy_prob = current_policy_probs_a
-        reference_policy_prob = reference_policy_probs_a
-
-    else:
-        preference_score = preference_score_b
-
-        current_policy_prob = current_policy_probs_b
-        reference_policy_prob = reference_policy_probs_b
+    log_current_prob_a = torch.log(current_policy_probs_a)
+    log_current_prob_b = torch.log(current_policy_probs_b)
+    log_reference_prob_a = torch.log(reference_policy_probs_a)
+    log_reference_prob_b = torch.log(reference_policy_probs_b)
 
     # See equation (9)
     # KL divergence regularization term helps to prevent the current policy
     # from diverging too much from the reference policy during the optimization
-    kl_regularization = tau * torch.log(current_policy_prob / reference_policy_prob)
+    # kl_regularization is proportional to torch.log(current_policy_prob / reference_policy_prob)
+    current_kl_divergence_a = log_current_prob_a - log_reference_prob_a
+    current_kl_divergence_b = log_current_prob_b - log_reference_prob_b
 
-    # Subtract the baseline (average preference score) for variance reduction
-    # to reduce the variance of the policy gradient estimate, which can help
-    # stabilize training
-    # we do not use preference_score.mean(), see equation (9) in NLHF paper
+    """
+    The generation of a token at a particular position in the sequence,
+    says [A, B, C, D] depends on the previous tokens and the input context.
+    The future tokens in the sequence do not directly influence the
+    generation of the current token. However, the KL estimator terms for
+    the future tokens still provide relevant information for estimating the
+    gradient of the current token.
+
+    The reason is that the KL estimator terms capture the discrepancy
+    between the learned policy 𝜋𝜃 and the reference policy 𝜇 for the entire
+    sequence. By considering the KL estimator terms for the current token
+    and the subsequent tokens, we take into account how the current token's
+    generation affects the overall sequence and its alignment with the
+    reference policy.
+
+    In the example of estimating the gradient for token B (index 𝑛 = 1),
+    multiplying the gradient term ∇𝜃 log 𝜋𝜃(B|A) by the KL estimator terms
+    for tokens B, C, and D (indices 𝑚 ≥ 1) helps to capture the impact of
+    generating token B on the subsequent tokens and the overall sequence.
+
+    While the generation of token B does not directly depend on the future
+    tokens C and D, the KL estimator terms for tokens C and D provide info
+    about how well the generated sequence aligns with the reference policy.
+
+    By including these terms in the gradient estimate for token B, we
+    account for the long-term impact of generating token B on the quality
+    of the entire sequence.
+
+    The variance-reduction trick of multiplying the gradient term by the
+    KL estimator terms corresponding to indices at least as great as 𝑛
+    helps to reduce the variance of the gradient estimate by focusing on
+    the relevant information from the current and subsequent tokens,
+    while reducing the influence of irrelevant information from the
+    previous tokens.
+
+    Credit: Claude-3-Opus-200k AI chatbot
+    """
+
+    # Initialize the gradient term for the current policy 𝜋𝜃 using equation (9)
+    current_gradient_term_a = torch.zeros_like(log_current_prob_a)
+    current_gradient_term_b = torch.zeros_like(log_current_prob_b)
+
+    current_kl_estimator_a = None
+    current_kl_estimator_b = None
+    for n in range(log_current_prob_a.size(1)):
+        """
+        In practice, when the response 𝑦 comprises a sequence of tokens 𝑦0:𝑁,
+        a sample-based estimator to the KL based on the sample response 𝑦 can be used.
+
+        Further, this can be decomposed into a sum across token indicies of per-token
+        KL estimators, and the standard policy-gradient variance-reduction trick of
+        only multiplying ∇𝜃 log 𝜋𝜃( 𝑦𝑛|𝑥, 𝑦0:𝑛−1) by KL estimator terms corresponding
+        to indices at least as great as 𝑛 can be applied.
+
+        Credit: Quoted directly from section 7.2 of NLHF paper
+        """
+        # Calculate the gradient term using equation (9)
+        current_gradient_term_a[:, n] = torch.autograd.grad(log_current_prob_a[:, n], model.parameters(), retain_graph=True)[0]
+        current_gradient_term_b[:, n] = torch.autograd.grad(log_current_prob_b[:, n], model.parameters(), retain_graph=True)[0]
+
+        # Apply the variance-reduction trick
+        current_kl_estimator_a = torch.sum(current_kl_divergence_a[:, n:], dim=1)
+        current_kl_estimator_b = torch.sum(current_kl_divergence_b[:, n:], dim=1)
+        current_gradient_term_a[:, n] *= current_kl_estimator_a
+        current_gradient_term_b[:, n] *= current_kl_estimator_b
+
+
+    # Calculate the preference loss using equation (9)
+    '''
+    (1 - human_preferences) inverts the preference,
+    so when a value of 1 indicates a preference for state-action pair (b),
+    a value of 0 would indicate a preference for state-action pair (a).
+
+    baseline = 0.5 is subtracted to center the preference around 0
+    Subtract the baseline (average preference score) for variance reduction
+    to reduce the variance of the policy gradient estimate, which can help
+    stabilize training
+    we do not use preference_score.mean(), see equation (9) in NLHF paper
+
+    tau * kl_divergence is the KL divergence regularization term
+    for state-action pair, weighted by the coefficient tau.
+
+    So equation (9) effectively maximizes the probability of the
+    preferred state-action pair while minimizing the probability
+    of the less preferred pair.
+
+    It encourages the policy to stay close to the reference policy
+    for the state-action pair.
+    '''
     baseline = 0.5
-    return preference_score - baseline - kl_regularization
+
+    # Calculate the expectation over states and actions using equation (10)
+    preference_loss = torch.mean((human_preferences - baseline - tau * current_kl_estimator_a) * current_gradient_term_a -
+                                 ((1 - human_preferences) - baseline - tau * current_kl_estimator_b) * current_gradient_term_b)
+
+
+    # Calculate the alternative policy 𝜋′ for state-action pairs (a) and (b) using equation (11)
+    alternative_policy_prob_a = alternative_policy(current_policy_probs_a, reference_policy_probs_a)
+    alternative_policy_prob_b = alternative_policy(current_policy_probs_b, reference_policy_probs_b)
+
+    # Incorporate the alternative policy 𝜋′ into the expectation defined in equation (10)
+    log_alternative_prob_a = torch.log(alternative_policy_prob_a)
+    log_alternative_prob_b = torch.log(alternative_policy_prob_b)
+
+    # See equation (9)
+    # KL divergence regularization term helps to prevent the alternative policy
+    # from diverging too much from the reference policy during the optimization
+    # kl_regularization is proportional to torch.log(alternative_policy_prob / reference_policy_prob)
+    alternative_kl_divergence_a = log_alternative_prob_a - log_reference_prob_a
+    alternative_kl_divergence_b = log_alternative_prob_b - log_reference_prob_b
+
+    # Initialize the gradient term for the alternative policy 𝜋′ using equation (9)
+    alternative_gradient_term_a = torch.zeros_like(log_alternative_prob_a)
+    alternative_gradient_term_b = torch.zeros_like(log_alternative_prob_b)
+
+    alternative_kl_estimator_a = None
+    alternative_kl_estimator_b = None
+    for n in range(log_alternative_prob_a.size(1)):
+        """
+        In practice, when the response 𝑦 comprises a sequence of tokens 𝑦0:𝑁,
+        a sample-based estimator to the KL based on the sample response 𝑦 can be used.
+
+        Further, this can be decomposed into a sum across token indicies of per-token
+        KL estimators, and the standard policy-gradient variance-reduction trick of
+        only multiplying ∇𝜃 log 𝜋𝜃( 𝑦𝑛|𝑥, 𝑦0:𝑛−1) by KL estimator terms corresponding
+        to indices at least as great as 𝑛 can be applied.
+
+        Credit: Quoted directly from section 7.2 of NLHF paper
+        """
+        # Calculate the gradient term using equation (9)
+        alternative_gradient_term_a[:, n] = torch.autograd.grad(log_alternative_prob_a[:, n], model.parameters(), retain_graph=True)[0]
+        alternative_gradient_term_b[:, n] = torch.autograd.grad(log_alternative_prob_b[:, n], model.parameters(), retain_graph=True)[0]
+
+        # Apply the variance-reduction trick
+        alternative_kl_estimator_a = torch.sum(alternative_kl_divergence_a[:, n:], dim=1)
+        alternative_kl_estimator_b = torch.sum(alternative_kl_divergence_b[:, n:], dim=1)
+        alternative_gradient_term_a[:, n] *= alternative_kl_estimator_a
+        alternative_gradient_term_b[:, n] *= alternative_kl_estimator_b
+
+
+    alternative_preference_loss = torch.mean((human_preferences - baseline - tau * alternative_kl_estimator_a) * alternative_gradient_term_a -
+                                             ((1 - human_preferences) - baseline - tau * alternative_kl_estimator_b) * alternative_gradient_term_b)
+
+    assert preference_loss.max() <= 1
+    assert alternative_preference_loss.max() <= 1
+
+    return preference_loss, alternative_preference_loss
 
 
 # Dataset selection
@@ -461,19 +619,6 @@ state_action_b_mask = state_action_b['attention_mask']
 print("state_ids shape:", state_ids.shape)
 print("state_action_a_ids shape:", state_action_a_ids.shape)
 print("state_action_b_ids shape:", state_action_b_ids.shape)
-
-# Assuming we have a current policy model, a reference model, and
-# a human preferences dictionary
-preference_score = preference_model(
-    state=state_ids,
-    state_action_a=state_action_a_ids,
-    state_action_b=state_action_b_ids,
-    mask_a=state_action_a_mask,
-    mask_b=state_action_b_mask,
-    model=current_policy,
-    reference_model=reference_policy,
-    human_preferences=preference
-)
 
 
 class SHPDataset(Dataset):
@@ -867,9 +1012,6 @@ for epoch in tqdm(range(num_epochs)):  # loop over the dataset multiple times
         mask_b = batch['mask_b'].clone().to(device)
         human_preferences = batch['preference'].clone().to(device)
 
-        # Initialize a dictionary to store updated policies for each action
-        updated_policies = {}
-
         """
         See Section 7.1 of the NLHF paper.
 
@@ -976,9 +1118,6 @@ for epoch in tqdm(range(num_epochs)):  # loop over the dataset multiple times
         # Set max_response_length to a value slightly higher than the average
         max_response_length = int(avg_response_length * 1.2)
 
-        # A list of state_action pairs
-        state_action_space = []
-
         # Generate current policy response token by token
         current_state_action = state_action_a  # Use state_action_a as the initial state-action pair for the current policy
         current_response = []
@@ -987,7 +1126,8 @@ for epoch in tqdm(range(num_epochs)):  # loop over the dataset multiple times
         alternative_state_action = state_action_b  # Use state_action_b as the initial state-action pair for the alternative policy
         alternative_response = []
 
-        for _ in range(max_response_length):
+        combined_loss = 0
+        for _ in range(max_response_length):  # Loop over every tokens in the sequence
             current_policy_prob = current_policy(current_state_action)
             reference_policy_prob = reference_policy(alternative_state_action)
 
@@ -1006,10 +1146,10 @@ for epoch in tqdm(range(num_epochs)):  # loop over the dataset multiple times
             alternative_token = torch.multinomial(marginal_mixture_prob, num_samples=1)
             alternative_response.append(alternative_token)
             alternative_state_action = torch.cat((alternative_token, alternative_state_action[:, 1:]), dim=1)
-            state_action_space.append(alternative_state_action)
 
-            # Calculate the preference score
-            preference_score = preference_model(
+
+            # Calculate the preference losses
+            preference_loss, alternative_preference_loss = preference_model(
                                    state,
                                    current_state_action,  # state_action_a,
                                    alternative_state_action,  # state_action_b,
@@ -1019,42 +1159,13 @@ for epoch in tqdm(range(num_epochs)):  # loop over the dataset multiple times
                                    reference_policy,
                                    human_preferences
                                )
-            # print(f"preference_score = {preference_score}")
-            # assert preference_score.min() >= 0
-            assert preference_score.max() <= 1
 
-            # Perform Nash-MD update, see equations (5) or (11) in NLHF paper
-            updated_policy_prob = \
-                (1 - eta) * torch.log(current_policy_prob) + \
-                eta * torch.log(reference_policy_prob) + \
-                eta * preference_score
+            # For each token, calculates cross-entropy loss for backpropagation as in section 8.1
+            # using the `combined_loss` variable
+            combined_loss += alpha * preference_loss + (1 - alpha) * alternative_preference_loss
 
-            updated_policy_prob = torch.exp(updated_policy_prob)
-            assert updated_policy_prob >= 0
-            assert updated_policy_prob <= 1
-
-            # Store the updated policy probability for the action
-            updated_policies[alternative_state_action] = updated_policy_prob
-
-        """
-        See section 7 of the paper
-
-        In equation (5), the normalization constant c is indeed important.
-        It ensures that after updating the policy using the Nash-MD algorithm,
-        the updated policy π_t+1 is still a valid probability distribution.
-
-        The constant c is determined after the update so that the
-        sum of probabilities across all possible actions y equals 1.
-        """
-        # Normalize the updated policies
-        log_updated_policies = [torch.log(prob) for prob in updated_policies.values()]
-        log_normalization_constant = torch.logsumexp(torch.stack(log_updated_policies), dim=0)
-        # assert log_normalization_constant <= 0
-
-        log_updated_policies_normalized = \
-            [log_prob - log_normalization_constant for log_prob in log_updated_policies]
-
-        assert max(log_updated_policies_normalized) <= 0  # prob <= 1, so log(prob) <= 0
+        # Calculate the average combined loss across all tokens
+        combined_loss /= max_response_length
 
         """
         Theorem 1 in the paper is related to the convergence properties of the
@@ -1096,15 +1207,8 @@ for epoch in tqdm(range(num_epochs)):  # loop over the dataset multiple times
         )
         """
 
-        # Calculate cross-entropy loss for backpropagation as in section 8.1
-        loss = -torch.sum(torch.stack(log_updated_policies_normalized))
-
-        # Calculate MSE loss for backpropagation as in section 8.1
-        # loss = torch.mean((torch.stack(log_updated_policies_normalized) - \
-        #                    torch.log(normalized_preference_scores)) ** 2)
-
         # Perform backpropagation
-        loss.backward(retain_graph=True)
+        combined_loss.backward(retain_graph=True)
 
         # Clip gradients: gradients are modified in place
         max_grad_norm = 1.5
