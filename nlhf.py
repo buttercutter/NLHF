@@ -108,15 +108,20 @@ elif USE_NLP:
     # Create model instance
     if USE_BERT:
         bert_model = AutoModel.from_pretrained("prajjwal1/bert-tiny").to(device)
-    elif USE_CAUSAL_LM or USE_MAMBA:
+        # bert_model = AutoModel.from_pretrained("prajjwal1/bert-medium").to(device)
+    elif USE_CAUSAL_LM:
         # bert_model = AutoModelForCausalLM.from_pretrained("ContextualAI/archangel_sft-dpo_llama7b")
         bert_model = AutoModelForCausalLM.from_pretrained("AdamG012/chat-opt-350m-reward-deepspeed")
-        # bert_model = AutoModelForCausalLM.from_pretrained("Q-bert/Mamba-370M", trust_remote_code=True)
+    elif USE_MAMBA:
+        bert_model = AutoModelForCausalLM.from_pretrained("Q-bert/Mamba-370M", trust_remote_code=True)
     elif USE_SEQ2SEQ_LM:
         bert_model = AutoModelForSeq2SeqLM.from_pretrained("stanfordnlp/SteamSHP-flan-t5-large")
 
     # for attr, value in bert_model.config.__dict__.items():
     #     print(f"{attr}: {value}")
+
+    if USE_MAMBA:
+        bert_model.config.hidden_size = bert_model.config.d_inner
 
     print(f"bert_model.config.hidden_size = {bert_model.config.hidden_size}")
 
@@ -555,10 +560,10 @@ elif USE_NLP:
     # Load one of the subreddits
     dataset = load_dataset("stanfordnlp/shp", data_dir="explainlikeimfive")
 
-    # tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
+    tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
     # tokenizer = AutoTokenizer.from_pretrained("ContextualAI/archangel_sft-dpo_llama7b")
     # tokenizer = AutoTokenizer.from_pretrained("AdamG012/chat-opt-350m-reward-deepspeed")
-    tokenizer = AutoTokenizer.from_pretrained("stanfordnlp/SteamSHP-flan-t5-large")
+    # tokenizer = AutoTokenizer.from_pretrained("stanfordnlp/SteamSHP-flan-t5-large")
 
     def preprocess_shp_entry(entry):
 
@@ -1132,13 +1137,14 @@ for epoch in tqdm(range(num_epochs)):  # loop over the dataset multiple times
           the next token generation step.
         """
 
-        # Calculate the average response length in the dataset
-        response_lengths = [len(entry['human_ref_A'].split()) + len(entry['human_ref_B'].split())
-                            for entry in dataset['train']]
-        avg_response_length = sum(response_lengths) / len(response_lengths)
-
-        # Set max_response_length to a value slightly higher than the average
-        max_response_length = int(avg_response_length * 1.2)
+        # Calculate the maximum response length in the batch
+        # Instead of calculating the average response length across the entire dataset, 
+        # we calculate the maximum response length within the current batch.
+        # We use the mask_a and mask_b tensors to determine the actual length of each response in the batch. 
+        # The mask_a and mask_b tensors have the same shape as state_action_a and state_action_b, respectively, 
+        # with values of 1 indicating valid tokens and 0 indicating padding tokens.
+        # By applying sum(dim=1) to mask_a and mask_b, we obtain the actual length of each response in the batch.
+        max_response_length = max(mask_a.sum(dim=1).max().item(), mask_b.sum(dim=1).max().item())
 
         # Generate current policy response token by token
         current_state_action = state_action_a  # Use state_action_a as the initial state-action pair for the current policy
@@ -1164,6 +1170,9 @@ for epoch in tqdm(range(num_epochs)):  # loop over the dataset multiple times
 
             log_marginal_mixture = tau * torch.log(current_policy_prob) + (1 - tau) * torch.log(reference_policy_prob)
             alternative_policy_prob = torch.exp(log_marginal_mixture)
+
+            assert alternative_policy_prob >= 0
+            assert alternative_policy_prob <= 1
 
             alternative_token = torch.multinomial(alternative_policy_prob, num_samples=1)
             alternative_response.append(alternative_token)
