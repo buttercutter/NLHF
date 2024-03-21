@@ -635,6 +635,12 @@ elif USE_NLP:
     # reference_policy.load_state_dict(torch.load('path_to_checkpoint'))
 
 # Set reference policy to evaluation mode if it's not being trained
+# This matches NLHF equation (10) stop-gradient requirement for `alternative_policy`
+# where it is being derived from both `current_policy` and `reference_policy`
+# using equation (11).
+# Quoted from [IPO-MD paper](http://arxiv.org/abs/2403.08635):
+# Nash-MD-PG is on-policy, in that the only gradient contributions appearing in
+# its update are those corresponding to actions sampled under the current policy.
 reference_policy.eval()
 
 # Extracting token IDs for state, action_a and action_b
