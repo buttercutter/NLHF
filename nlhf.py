@@ -55,8 +55,12 @@ def print_tensor_info(tensor_name, tensor):
 
 # Adjusting beta affects the balance between exploiting the current policy
 # and exploring new policies suggested by the reference model or feedback.
-beta = 0.5
-tau = 1 - beta
+# result is the best with beta=0.1 according to Appendix B.2 of IPO-MD paper
+beta = 0.1
+
+# temperature coefficient, independent of beta parameter above used for mixture
+# result is the best with tau=1.0 according to Appendix B.1 of IPO-MD paper
+tau = 1.0
 
 # alpha is the weight on how to linearly combine the preference losses
 alpha = 0.5
@@ -1133,8 +1137,8 @@ for epoch in tqdm(range(num_epochs)):  # loop over the dataset multiple times
           policy probabilities and reference policy probabilities
           using the formula:
             log_marginal_mixture =
-                    tau * torch.log(current_policy_prob) +
-                    (1 - tau) * torch.log(reference_policy_prob).
+                    (1 - beta) * torch.log(current_policy_prob) +
+                    beta * torch.log(reference_policy_prob).
         - We sample a token from the marginal mixture probabilities
           using torch.multinomial() and append it to
           alternative_response.
@@ -1174,7 +1178,7 @@ for epoch in tqdm(range(num_epochs)):  # loop over the dataset multiple times
             current_response.append(current_token)
             current_state_action = torch.cat((current_token, current_state_action[:, 1:]), dim=1)
 
-            log_marginal_mixture = tau * torch.log(current_policy_prob) + (1 - tau) * torch.log(reference_policy_prob)
+            log_marginal_mixture = (1 - beta) * torch.log(current_policy_prob) + beta * torch.log(reference_policy_prob)
             alternative_policy_prob = torch.exp(log_marginal_mixture)
 
             assert alternative_policy_prob >= 0
