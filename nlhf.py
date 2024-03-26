@@ -1,4 +1,5 @@
-# [Nash Learning from Human Feedback](http://arxiv.org/abs/2312.00886)
+# [NLHF : Nash Learning from Human Feedback](http://arxiv.org/abs/2312.00886)
+# [IPO-MD : Human Alignment of Large Language Models through Online Preference Optimisation](http://arxiv.org/abs/2403.08635)
 
 
 import os
@@ -55,12 +56,12 @@ def print_tensor_info(tensor_name, tensor):
 
 # Adjusting beta affects the balance between exploiting the current policy
 # and exploring new policies suggested by the reference model or feedback.
-# result is the best with beta=0.1 according to Appendix B.2 of IPO-MD paper
-beta = 0.1
+# result is the best with beta=0.125 according to Appendix B.3 of IPO-MD paper
+beta = 0.125
 
 # temperature coefficient, independent of beta parameter above used for mixture
-# result is the best with tau=1.0 according to Appendix B.1 of IPO-MD paper
-tau = 1.0
+# result is the best with tau=0.008 according to Appendix B.3 of IPO-MD paper
+tau = 0.008
 
 # alpha is the weight on how to linearly combine the preference losses
 alpha = 0.5
@@ -1003,7 +1004,7 @@ if USE_ADAMW_ON_LION:
 
     optimizer_current_policy = AdamW_on_Lion_Optimizer(
                                     params=current_policy.parameters(),
-                                    lr=1e-3,
+                                    lr=3e-5,
                                     adam_betas=(0.9, 0.999),
                                     lion_betas=(0.9, 0.999),
                                     eps=1e-8,
@@ -1011,7 +1012,7 @@ if USE_ADAMW_ON_LION:
                                )
     optimizer_reference_policy = AdamW_on_Lion_Optimizer(
                                     params=reference_policy.parameters(),
-                                    lr=1e-3
+                                    lr=3e-5
                                  )
 
 elif USE_ADAMW:
