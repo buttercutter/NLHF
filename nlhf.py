@@ -391,6 +391,15 @@ def preference_model(state, state_action_a, state_action_b, mask_a, mask_b,
     stabilize training
     we do not use preference_score.mean(), see equation (9) in NLHF paper
 
+    There is also another reason for using baseline = 0.5, see
+    proposition D.1 in the IPO-MD paper:
+ 
+    p(y ≻ y′) = 1 - p(y′ ≻ y) for all y, y′ ∈ Y
+    f(y, y′) := p(y ≻ y′) - 1/2 - τ log(π(y)/π_ref(y)) + τ log(π(y′)/π_ref(y′))
+
+    So, the baseline is set to 1/2 to ensure that the preference loss f()
+    satisfies the requirements of f(y, y′) = -f(y′, y)
+
     tau * kl_divergence is the KL divergence regularization term
     for state-action pair, weighted by the coefficient tau.
 
