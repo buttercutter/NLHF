@@ -4,6 +4,7 @@
 
 import os
 import math
+import random
 import numpy as np
 import torch
 import torch.nn as nn
@@ -553,6 +554,10 @@ if USE_ATARI:
     import gym
     # print(f"list of all gym environments = {gym.envs.registry.keys()}")
     env = gym.make('Pong-v4')
+
+    # For Atari games, get the action space size from the environment
+    num_actions = env.action_space.n
+
     state = env.reset()  # Reset the environment to get the initial state
 
     # Assuming the first element of the tuple is the screen image we want
@@ -578,6 +583,9 @@ elif USE_NLP:
     # tokenizer = AutoTokenizer.from_pretrained("ContextualAI/archangel_sft-dpo_llama7b")
     # tokenizer = AutoTokenizer.from_pretrained("AdamG012/chat-opt-350m-reward-deepspeed")
     # tokenizer = AutoTokenizer.from_pretrained("stanfordnlp/SteamSHP-flan-t5-large")
+
+    # For NLP models,  get the action space size from tokenizer's vocab size
+    num_actions = tokenizer.vocab_size
 
     def preprocess_shp_entry(entry):
 
@@ -1029,6 +1037,117 @@ elif USE_ADAMW:
     optimizer_reference_policy = optim.AdamW(reference_policy.parameters(),
                                              lr=1e-3)
 
+
+"""
+Lemma 1 in the NLHF paper is a general statement about the relationship between
+the KL divergences of different policies. It does not specifically depend on the
+representation of the policies as tensors or scalars.
+
+In the context of the NLHF paper, the policies are typically represented as
+probability distributions over actions or tokens.
+
+These probability distributions can be represented in different ways,
+depending on the specific problem and the chosen policy parameterization.
+
+1. Tensor representation: In many cases, policies are represented as tensors,
+   especially when dealing with complex action spaces or sequences.
+   For example, in language models, the policies are often represented as
+   tensors of probabilities over the vocabulary at each step, as discussed in
+   the previous response.
+
+2. Scalar representation: In simpler cases, policies can be represented as scalars.
+   For example, if the action space is binary (e.g., a yes/no decision), the policy
+   could be represented as a single scalar value indicating the probability of
+   taking one of the actions.
+
+Lemma 1 holds regardless of the specific representation of the policies, as long as
+the KL divergences between the policies can be computed. Lemma 1 states that:
+
+KL(π, πₜ^μ) ≤ ητKL(π, μ) + (1 - ητ)KL(π, πₜ)
+
+where:
+- π is any policy
+- πₜ is the policy at iteration t
+- μ is the reference policy
+- πₜ^μ is the policy obtained by a geometric mixture of πₜ and μ
+- ητ is a scalar value between 0 and 1
+
+The KL divergences in the Lemma 1, such as KL(π, μ) and KL(π, πₜ), are scalar values
+that measure the difference between two probability distributions.
+
+These KL divergences can be computed regardless of whether the policies are
+represented as tensors or scalars, as long as the probability distributions are
+well-defined.
+
+In summary, while the NLHF paper often uses tensor representations for policies
+due to the nature of the problems being addressed, Lemma 1 itself is a general
+statement that holds for any valid representation of policies, including scalars,
+as long as the KL divergences can be computed.
+
+Credit: Claude-3-Opus-200k
+"""
+
+def lemma1(pi_t, pi_mu_t, mu, eta=3e-5, tau=tau):
+    """
+    This function asserts the inequality from Lemma 1 in the NLHF paper
+
+    pi_t: policy at iteration t
+    pi_mu_t: policy obtained by a geometric mixture of pi_t and mu
+    mu: reference policy
+    eta: learning rate, scalar value between 0 and 1
+    tau: regularization coefficient, scalar value between 0 and 1
+    """
+
+    # Generate a random policy 𝜋 for testing
+    def generate_random_policy(num_actions):
+        # Generate a random vector of probabilities
+        policy_probs = torch.rand(num_actions)
+        # Normalize to make it a valid probability distribution
+        policy_probs /= policy_probs.sum()
+        # Sample a random action from the policy
+        random_integer = random.randint(0, num_actions-1)
+        return policy_probs[random_integer]
+
+    pi = generate_random_policy(num_actions)  # Arbitrary policy 𝜋
+
+    # Print out the policy to see the value
+    # print(f"Arbitrary policy pi: {pi}")
+
+    # Compute the KL divergences
+    # kl_pi_mu = torch.distributions.kl_divergence(pi, mu)
+    # kl_pi_pi_t = torch.distributions.kl_divergence(pi, pi_t)
+    # kl_pi_mu_t_mu = torch.distributions.kl_divergence(pi_mu_t, mu)
+
+    # Compute the KL divergences manually since the distributions are not defined
+    kl_pi_mu = pi * torch.log(pi / mu)
+    kl_pi_pi_t = pi * torch.log(pi / pi_t)
+    kl_pi_mu_t_mu = pi_mu_t * torch.log(pi_mu_t / mu)
+
+    # Calculate the right side of the inequality
+    rhs = eta * tau * kl_pi_mu + (1 - eta * tau) * kl_pi_pi_t - eta * tau * kl_pi_mu_t_mu
+
+    # Assert the inequality from Lemma 1
+    assert pi * torch.log(pi / pi_mu_t) <= rhs, "Lemma 1 inequality does not hold"
+
+    return True  # If Lemma 1 passes, return True
+
+
+# Please see Theorem 1 inside the NLHF paper
+def theorem1_eq6(pi_star_tau, pi_t, pi_t_plus_1, eta, tau):
+    # Compute the KL divergences
+    kl_pi_star_tau_pi_t = torch.distributions.kl_divergence(pi_star_tau, pi_t)
+    kl_pi_star_tau_pi_t_plus_1 = torch.distributions.kl_divergence(pi_star_tau, pi_t_plus_1)
+
+    # Assert the inequality from Theorem 1 (equation 6)
+    assert torch.allclose(
+        kl_pi_star_tau_pi_t_plus_1,
+        (1 - eta * tau) * kl_pi_star_tau_pi_t + 2 * eta**2,
+        atol=1e-5,  # Adjust the tolerance as needed
+    ), "Theorem 1 (equation 6) inequality does not hold"
+
+    return True  # If Theorem 1 passes, return True
+
+
 # Training loop
 num_epochs = 25  # Number of epochs to train for
 
@@ -1198,6 +1317,8 @@ for epoch in tqdm(range(num_epochs)):  # loop over the dataset multiple times
             alternative_response.append(alternative_token)
             alternative_state_action = torch.cat((alternative_token, alternative_state_action[:, 1:]), dim=1)
 
+            # Test Lemma 1 of the NLHF paper
+            # lemma1(current_policy_prob, alternative_policy_prob, reference_policy_prob, eta=3e-5, tau=tau)
 
             # Calculate the preference losses
             current_preference_loss, alternative_preference_loss = preference_model(
