@@ -25,7 +25,7 @@ if USE_NLP:
     USE_SEQ2SEQ_LM = 0
     USE_MAMBA = 0
 
-USE_ADAMW_ON_LION = 1
+USE_ADAMW_ON_LION = 0
 USE_ADAMW = ~USE_ADAMW_ON_LION
 
 
@@ -135,7 +135,7 @@ elif USE_NLP:
         def __init__(self, state_dim):
             super(PolicyNetwork, self).__init__()
             self.bert = bert_model
-            self.final_layer = nn.Linear(self.bert.config.hidden_size, 1)
+            self.final_layer = nn.Linear(self.bert.config.hidden_size, num_actions)
             self.dropout = nn.Dropout(0.2)  # Add dropout
             self.relu = nn.ReLU()
 
@@ -177,13 +177,13 @@ elif USE_NLP:
                 text_embeddings = intermediate_layer(text_embeddings)
 
             # Combine and score
-            score = self.final_layer(text_embeddings)
+            next_token = self.final_layer(text_embeddings)
 
-            # for numerical stability
-            # score = self.relu(score) + 1e-6
-            score = torch.sigmoid(score)
+            # for sampling next token y_n distributions (implemented as a softmax over logits)
+            # See section 7.1 of NLHF paper for more details
+            next_token = torch.softmax(next_token, dim=-1)
 
-            return score
+            return next_token
 
 
 """
@@ -215,10 +215,10 @@ See also expression (1.1), section 4 and Theorem 1 of
 
 def alternative_policy(current_policy_probs, reference_policy_probs):
     # Calculate the alternative policy 𝜋′ using equation (11)
-    log_alternative_policy_prob = (1 - beta) * torch.log(current_policy_probs) + \
+    log_alternative_policy_probs = (1 - beta) * torch.log(current_policy_probs) + \
                                 beta * torch.log(reference_policy_probs)
 
-    alternative_policy_prob = torch.exp(log_alternative_policy_prob)
+    alternative_policy_probs = torch.exp(log_alternative_policy_probs)
 
     """
     See section 7 of the paper
@@ -231,7 +231,7 @@ def alternative_policy(current_policy_probs, reference_policy_probs):
     sum of probabilities across all possible actions y equals 1.
     """
     # Normalize the alternative policy 𝜋′ using equation (11)
-    alternative_policy_prob = alternative_policy_prob / alternative_policy_prob.sum(dim=-1, keepdim=True)
+    alternative_policy_probs = alternative_policy_probs / alternative_policy_probs.sum(dim=-1, keepdim=True)
 
     """
     The following needs some pondering and may need to be revisited.
@@ -245,10 +245,10 @@ def alternative_policy(current_policy_probs, reference_policy_probs):
     Credit: Quoted directly from section 7.1 of NLHF paper
     """
 
-    assert alternative_policy_prob >= 0
-    assert alternative_policy_prob <= 1
+    assert torch.all(alternative_policy_probs >= 0)
+    assert torch.all(alternative_policy_probs <= 1)
 
-    return alternative_policy_prob
+    return alternative_policy_probs
 
 
 def preference_model(state, state_action_a, state_action_b, mask_a, mask_b,
@@ -1096,38 +1096,54 @@ def lemma1(pi_t, pi_mu_t, mu, eta=3e-5, tau=tau):
     mu: reference policy
     eta: learning rate, scalar value between 0 and 1
     tau: regularization coefficient, scalar value between 0 and 1
+    sequence_length: length of the sequence
     """
 
     # Generate a random policy 𝜋 for testing
     def generate_random_policy(num_actions):
-        # Generate a random vector of probabilities
-        policy_probs = torch.rand(num_actions)
-        # Normalize to make it a valid probability distribution
-        policy_probs /= policy_probs.sum()
-        # Sample a random action from the policy
-        random_integer = random.randint(0, num_actions-1)
-        return policy_probs[random_integer]
+        # Generate a random tensor of probabilities for each action
+        # at each step or sequence slot
+        policy_probs = torch.rand((1, num_actions))
+        # Softmax distribution required in section 7.1 of NLHF paper
+        policy_probs = torch.softmax(policy_probs, dim=-1)
+        return policy_probs
 
+    # Generates probability distribution for all different possible tokens
+    # at each step or sequence slot
     pi = generate_random_policy(num_actions)  # Arbitrary policy 𝜋
 
-    # Print out the policy to see the value
+    # Print out the policy to see the values
     # print(f"Arbitrary policy pi: {pi}")
 
-    # Compute the KL divergences
-    # kl_pi_mu = torch.distributions.kl_divergence(pi, mu)
-    # kl_pi_pi_t = torch.distributions.kl_divergence(pi, pi_t)
-    # kl_pi_mu_t_mu = torch.distributions.kl_divergence(pi_mu_t, mu)
 
-    # Compute the KL divergences manually since the distributions are not defined
-    kl_pi_mu = pi * torch.log(pi / mu)
-    kl_pi_pi_t = pi * torch.log(pi / pi_t)
-    kl_pi_mu_t_mu = pi_mu_t * torch.log(pi_mu_t / mu)
+    # Compute step by step the KL divergence between two distributions (pi_1 and pi_2),
+    # with only single action or token at any compute cycle
+    def compute_kl_divergence(pi_1, pi_2):
+        # Removes the unnessary dimension due to tokenizer() function
+        # because torch.distributions.kl_divergence() needs more than 1 dimension
+        pi_1 = pi_1.squeeze(0)
+        pi_2 = pi_2.squeeze(0)
+
+        # print(f"pi_1.shape = {pi_1.shape}, pi_2.shape = {pi_2.shape}, \
+        #       num_actions = {num_actions}")
+        
+        kl_divergence = torch.distributions.kl_divergence(
+            torch.distributions.Categorical(probs=pi_1),
+            torch.distributions.Categorical(probs=pi_2)
+        )
+        return kl_divergence
+
+    # Compute the KL divergences
+    kl_pi_mu = compute_kl_divergence(pi, mu)
+    kl_pi_pi_t = compute_kl_divergence(pi, pi_t)
+    kl_pi_mu_t_mu = compute_kl_divergence(pi_mu_t, mu)
 
     # Calculate the right side of the inequality
     rhs = eta * tau * kl_pi_mu + (1 - eta * tau) * kl_pi_pi_t - eta * tau * kl_pi_mu_t_mu
 
     # Assert the inequality from Lemma 1
-    assert pi * torch.log(pi / pi_mu_t) <= rhs, "Lemma 1 inequality does not hold"
+    assert compute_kl_divergence(pi, pi_mu_t) <= rhs, \
+        "Lemma 1 inequality does not hold"
 
     return True  # If Lemma 1 passes, return True
 
@@ -1293,32 +1309,47 @@ for epoch in tqdm(range(num_epochs)):  # loop over the dataset multiple times
         alternative_state_action = state_action_b  # Use state_action_b as the initial state-action pair for the alternative policy
         alternative_response = []
 
+        # Initialize the log marginal mixture tensor and the combined loss
+        log_marginal_mixture = torch.zeros((1, num_actions))
         combined_loss = 0
-        for _ in range(max_response_length):  # Loop over every tokens in the sequence
-            current_policy_prob = current_policy(current_state_action)
-            reference_policy_prob = reference_policy(alternative_state_action)
 
-            assert current_policy_prob >= 0
-            assert current_policy_prob <= 1
-            assert reference_policy_prob >= 0
-            assert reference_policy_prob <= 1
+        for t in range(max_response_length):  # Loop over every token slot in the sequence
+            # Obtains the current and reference policies probabilities 
+            # for all the possible actions/tokens in that specific slot
+            current_policy_probs = current_policy(current_state_action)
+            reference_policy_probs = reference_policy(alternative_state_action)
 
-            current_token = torch.multinomial(current_policy_prob, num_samples=1)
+            assert torch.all(current_policy_probs >= 0)
+            assert torch.all(current_policy_probs <= 1)
+            assert torch.all(reference_policy_probs >= 0)
+            assert torch.all(reference_policy_probs <= 1)
+
+            # Samples a next token 𝑦𝑛 from the softmax distribution of current_policy
+            # Implements token-per-token "autoregressive" (hence only up to previous t token) generation of responses 𝑦 ∼ 𝜋(·|𝑥)
+            current_token = torch.multinomial(current_policy_probs[:, :t+1], num_samples=1)
             current_response.append(current_token)
-            current_state_action = torch.cat((current_token, current_state_action[:, 1:]), dim=1)
+            # print(f'current_token.size(): {current_token.size()}, current_state_action[:, 1:].size(): {current_state_action[:, 1:].size()}')
+            current_state_action = torch.cat((current_token, current_state_action[:, 1:]), dim=-1)
 
-            log_marginal_mixture = (1 - beta) * torch.log(current_policy_prob) + beta * torch.log(reference_policy_prob)
-            alternative_policy_prob = torch.exp(log_marginal_mixture)
+            # See equation (11) of the NLHF paper
+            # Calculate the marginal geometric mixture of the current policy and the reference policy
+            log_marginal_mixture[:, :t+1] = (1 - beta) * torch.log(current_policy_probs[:, :t+1]) + beta * torch.log(reference_policy_probs[:, :t+1])
+            alternative_policy_probs = torch.exp(log_marginal_mixture)
 
-            assert alternative_policy_prob >= 0
-            assert alternative_policy_prob <= 1
+            assert torch.all(alternative_policy_probs >= 0)
+            assert torch.all(alternative_policy_probs <= 1)
 
-            alternative_token = torch.multinomial(alternative_policy_prob, num_samples=1)
+            # Samples a next token 𝑦𝑛 from the softmax distribution of alternative_policy
+            alternative_token = torch.multinomial(alternative_policy_probs, num_samples=1)
             alternative_response.append(alternative_token)
-            alternative_state_action = torch.cat((alternative_token, alternative_state_action[:, 1:]), dim=1)
+            # print(f'alternative_token.size(): {alternative_token.size()}, alternative_state_action[:, 1:].size(): {alternative_state_action[:, 1:].size()}')
+            alternative_state_action = torch.cat((alternative_token, alternative_state_action[:, 1:]), dim=-1)
 
             # Test Lemma 1 of the NLHF paper
-            # lemma1(current_policy_prob, alternative_policy_prob, reference_policy_prob, eta=3e-5, tau=tau)
+            # print(f"current_policy_probs.shape = {current_policy_probs.shape}, \
+            #        reference_policy_probs.shape = {reference_policy_probs.shape}, \
+            #        alternative_policy_probs.shape = {alternative_policy_probs.shape}")
+            lemma1(current_policy_probs, alternative_policy_probs, reference_policy_probs, eta=3e-5, tau=tau)
 
             # Calculate the preference losses
             current_preference_loss, alternative_preference_loss = preference_model(
