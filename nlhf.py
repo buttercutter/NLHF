@@ -195,13 +195,13 @@ elif USE_NLP:
                 text_embeddings = intermediate_layer(text_embeddings)
 
             # Combine and score
-            next_token = self.final_layer(text_embeddings)
+            possible_next_tokens = self.final_layer(text_embeddings)
 
             # for sampling next token y_n distributions (implemented as a softmax over logits)
             # See section 7.1 of NLHF paper for more details
-            next_token = torch.softmax(next_token, dim=-1)
+            possible_next_tokens = torch.softmax(possible_next_tokens, dim=-1)
 
-            return next_token
+            return possible_next_tokens
 
 
 """
@@ -404,7 +404,7 @@ def preference_model(state, state_action_a, state_action_b, mask_a, mask_b,
     so when a value of 1 indicates a preference for state-action pair (b),
     a value of 0 would indicate a preference for state-action pair (a).
 
-    baseline = 0.5 is subtracted to center the preference around 0
+    baseline = 0.5 is subtracted to center the preference around the middle.
     Subtract the baseline (average preference score) for variance reduction
     to reduce the variance of the policy gradient estimate, which can help
     stabilize training
@@ -412,7 +412,7 @@ def preference_model(state, state_action_a, state_action_b, mask_a, mask_b,
 
     There is also another reason for using baseline = 0.5, see
     proposition D.1 in the IPO-MD paper:
- 
+
     p(y ≻ y′) = 1 - p(y′ ≻ y) for all y, y′ ∈ Y
     f(y, y′) := p(y ≻ y′) - 1/2 - τ log(π(y)/π_ref(y)) + τ log(π(y′)/π_ref(y′))
 
@@ -684,7 +684,10 @@ elif USE_NLP:
 # Quoted from [IPO-MD paper](http://arxiv.org/abs/2403.08635):
 # Nash-MD-PG is on-policy, in that the only gradient contributions appearing in
 # its update are those corresponding to actions sampled under the current policy.
-reference_policy.eval()
+if USE_IPO_MD:
+    current_policy.eval()
+elif USE_NLHF:
+    reference_policy.eval()
 
 # Extracting token IDs for state, action_a and action_b
 state_ids = state['input_ids']
@@ -1120,6 +1123,15 @@ def compute_kl_divergence(pi_1, pi_2):
     )
     return kl_divergence
 
+# Generate a random policy 𝜋 for testing
+def generate_random_policy(num_actions):
+    # Generate a random tensor of probabilities for each action
+    # at each step or sequence slot
+    policy_probs = torch.rand((1, num_actions))
+    # Softmax distribution required in section 7.1 of NLHF paper
+    policy_probs = torch.softmax(policy_probs, dim=-1)
+    return policy_probs
+    
 def test_lemma1(pi_t, pi_mu_t, mu, eta=3e-5, tau=tau):
     """
     This function asserts the inequality from Lemma 1 in the NLHF paper
@@ -1131,15 +1143,6 @@ def test_lemma1(pi_t, pi_mu_t, mu, eta=3e-5, tau=tau):
     tau: regularization coefficient, scalar value between 0 and 1
     sequence_length: length of the sequence
     """
-
-    # Generate a random policy 𝜋 for testing
-    def generate_random_policy(num_actions):
-        # Generate a random tensor of probabilities for each action
-        # at each step or sequence slot
-        policy_probs = torch.rand((1, num_actions))
-        # Softmax distribution required in section 7.1 of NLHF paper
-        policy_probs = torch.softmax(policy_probs, dim=-1)
-        return policy_probs
 
     # Generates probability distribution for all different possible tokens
     # at each step or sequence slot
@@ -1168,17 +1171,16 @@ def test_lemma1(pi_t, pi_mu_t, mu, eta=3e-5, tau=tau):
 """
 Given the Stanford Human Preferences (SHP) dataset's nature, which typically
 contains comparative preference data (e.g., user preferences between pairs of
-options rather than explicit probabilities), you are correct in noting that
-fixed probabilities are not directly provided. Therefore, the most suitable
-approach is dynamically computing preferences based on the context and current
-policy evaluations.
+options rather than explicit probabilities), and fixed probabilities are not 
+directly provided. Therefore, the most suitable approach is dynamically computing 
+preferences based on the context and current policy evaluations.
 
 ### Why Dynamic Preference Modeling Fits SHP Data:
 
 1. **Relative Preferences**:
    - The SHP dataset usually includes paired comparisons (e.g., "Is option A
    better than option B?"). These can be used to infer relative strengths or
-   preferences but do not directly give you the probability P(y > pi_mu_t)
+   preferences but do not directly give the probability P(y > pi_mu_t)
    for action y over a policy pi_mu_t.
 
 2. **Learning from Feedback**:
@@ -1194,7 +1196,7 @@ policy evaluations.
 
 ### Implementing a Dynamic Preference Model
 
-Given the paired nature of data in SHP, here's how you could set up a dynamic
+Given the paired nature of data in SHP, here's how we could set up a dynamic
 preference computation:
 
 1. **Model Definition**:
@@ -1236,15 +1238,21 @@ def test_lemma2(pi, pi_t_plus_1, pi_mu_t, eta, current_preference):
     - pi_t_plus_1: Torch tensor, the policy at time t+1.
     - pi_mu_t: Torch tensor, the alternative mixture policy at time t.
     - eta: float, the learning rate or step size.
-    - current_preference: Torch tensor, the pre-computed preference probabilities P(y > pi_mu_t) for all y.
-                          See section 7.3 on why we can P(y > pi_mu_t) with P(y > pi_t)
+    - current_preference: Torch tensor, the preference probabilities P(y > 𝜋𝛽𝜃) for all y.
+                          See section 7.3 on why we can replace P(y > 𝜋𝛽𝜃) with P(y > 𝜇)
     """
 
-    if pi is None and pi_mu_t is None:
+    if pi_mu_t is None:
         # t=0, just started token generation of the very first token, and there is no policy yet for
         # the KL divergence comparison between timestep = t and t+1, so no meaningful testing result
-        # given that we are feeding in previous policy and current policy as pi and pi_t_plus_1 respectively
+        # given that we are feeding in "previous" mixture_policy and "current" policy as pi_mu_t and 
+        # pi_t_plus_1 respectively
+        print("At initial timestep, no policies available for comparison. Skipping Lemma 2 test...")
         return True  # If policies are None, return True
+
+    # Generates probability distribution for all different possible tokens
+    # at each step or sequence slot
+    pi = generate_random_policy(num_actions)  # Arbitrary policy 𝜋
 
     # Compute the KL divergences
     KL_pi_pi_t_plus_1 = compute_kl_divergence(pi, pi_t_plus_1)
@@ -1424,10 +1432,10 @@ for epoch in tqdm(range(num_epochs)):  # loop over the dataset multiple times
         """
 
         # Calculate the maximum response length in the batch
-        # Instead of calculating the average response length across the entire dataset, 
+        # Instead of calculating the average response length across the entire dataset,
         # we calculate the maximum response length within the current batch.
-        # We use the mask_a and mask_b tensors to determine the actual length of each response in the batch. 
-        # The mask_a and mask_b tensors have the same shape as state_action_a and state_action_b, respectively, 
+        # We use the mask_a and mask_b tensors to determine the actual length of each response in the batch.
+        # The mask_a and mask_b tensors have the same shape as state_action_a and state_action_b, respectively,
         # with values of 1 indicating valid tokens and 0 indicating padding tokens.
         # By applying sum(dim=1) to mask_a and mask_b, we obtain the actual length of each response in the batch.
         max_response_length = max(mask_a.sum(dim=1).max().item(), mask_b.sum(dim=1).max().item())
@@ -1449,7 +1457,7 @@ for epoch in tqdm(range(num_epochs)):  # loop over the dataset multiple times
         alternative_policy_probs_previous_step = None
 
         for t in range(max_response_length):  # Loop over every token slot in the sequence
-            # Obtains the current and reference policies probabilities 
+            # Obtains the current and reference policies probabilities
             # for all the possible actions/tokens in that specific slot
             current_policy_probs = current_policy(current_state_action)
             reference_policy_probs = reference_policy(alternative_state_action)
@@ -1499,7 +1507,7 @@ for epoch in tqdm(range(num_epochs)):  # loop over the dataset multiple times
                                )
 
             # Test Lemma 2 of the NLHF paper
-            # For now, we are only testing Lemma 2 using a specific policy 𝜋
+            # For now, Lemma 2 test only passes using a specific policy 𝜋 = 𝜋_(t-1)
             # We should test Lemma 2 for all different kinds of policy 𝜋 , as suggested in equation (14) description
             test_lemma2(pi=current_policy_probs_previous_step, pi_t_plus_1=current_policy_probs,
                         pi_mu_t=alternative_policy_probs_previous_step, eta=lr, current_preference=current_preference)
