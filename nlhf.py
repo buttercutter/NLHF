@@ -1290,6 +1290,68 @@ def test_lemma2(pi, pi_t_plus_1, pi_mu_t, eta, current_preference):
     regularization is equivalent. The additional 𝛽 parameter in equation (11) defining 𝜋𝛽𝜃 allows
     it to be tuned independently of 𝜏 used in equation (9).
 
+    Let's derive the equivalence of using 𝜋𝛽𝜃 or 𝜇 in the regularization term of the policy gradient estimate.
+    In section 7.3 , we have :
+
+    KL(𝜋𝜃, 𝜋 𝛽 𝜃) = (1 − 𝛽)KL(𝜋𝜃, 𝜋𝜃) + 𝛽KL(𝜋𝜃, 𝜇) − 𝔼𝑥∼𝜌 [𝑐(𝑥)] = 𝛽KL(𝜋𝜃, 𝜇) − 𝔼𝑥∼𝜌 [𝑐(𝑥)], 
+    
+    where 𝑐(𝑥) is the normalizing constant in Equation (11). Thus, we have ∇ 𝜃KL(𝜋𝜃, 𝜋 𝛽 𝜃) = 𝛽∇𝜃KL(𝜋𝜃, 𝜇)
+
+    This expression relates the KL divergence between the current policy 𝜋𝜃 and the mixture policy 𝜋 𝛽 𝜃 to 
+    the KL divergence between the current policy 𝜋𝜃 and the reference policy 𝜇. Let's break it down step by step:
+
+    1. KL(𝜋𝜃, 𝜋 𝛽 𝜃) represents the KL divergence between the current policy 𝜋𝜃 and the mixture policy 𝜋 𝛽 𝜃.
+
+    2. The mixture policy 𝜋 𝛽 𝜃 is defined as a geometric mixture of the current policy 𝜋𝜃 and the reference policy 𝜇, 
+    with mixing coefficient 𝛽. Specifically, 𝜋 𝛽 𝜃(𝑦|𝑥) = 𝜋𝜃(𝑦|𝑥)^(1−𝛽) 𝜇(𝑦|𝑥)^𝛽.
+
+    3. The KL divergence between the current policy and the mixture policy can be decomposed into two terms:
+    - (1 − 𝛽)KL(𝜋𝜃, 𝜋𝜃): This term represents the KL divergence between the current policy and itself, which is always zero.
+    - 𝛽KL(𝜋𝜃, 𝜇): This term represents the KL divergence between the current policy and the reference policy, scaled by the mixing coefficient 𝛽.
+
+    4. 𝔼𝑥∼𝜌 [𝑐(𝑥)] represents the expected value of the normalizing constant 𝑐(𝑥) over the state distribution 𝜌. 
+    The normalizing constant 𝑐(𝑥) is used in Equation (11) to ensure that the updated policy probabilities sum up to 1.
+
+    5. By subtracting the expected value of the normalizing constant 𝔼𝑥∼𝜌 [𝑐(𝑥)] from both sides of the equation, we obtain:
+    KL(𝜋𝜃, 𝜋 𝛽 𝜃) = 𝛽KL(𝜋𝜃, 𝜇) − 𝔼𝑥∼𝜌 [𝑐(𝑥)]
+
+    6. Finally, taking the gradient of both sides with respect to the policy parameters 𝜃 yields:
+    ∇ 𝜃KL(𝜋𝜃, 𝜋 𝛽 𝜃) = 𝛽∇𝜃KL(𝜋𝜃, 𝜇)
+
+    This equation states that the gradient of the KL divergence between the current policy and the mixture policy with 
+    respect to the policy parameters is equal to 𝛽 times the gradient of the KL divergence between the current policy and the reference policy.
+
+    The significance of this expression lies in the fact that it establishes a connection between the regularization term 
+    used in Nash-MD (KL(𝜋𝜃, 𝜋 𝛽 𝜃)) and the regularization term used in Nash-MD-PG (KL(𝜋𝜃, 𝜇)). It shows that the gradient of 
+    the KL divergence between the current policy and the mixture policy can be computed using only the gradient of the KL divergence 
+    between the current policy and the reference policy, scaled by the mixing coefficient 𝛽.
+
+    This relationship allows for a simplification of the regularization term in the Nash-MD-PG algorithm, as it can be expressed 
+    solely in terms of the KL divergence between the current policy and the reference policy, without explicitly involving the mixture policy.
+
+    Now, we will derive the maths inside section 7.3 to rigorously prove the above:
+
+    Expand the logarithm of the mixture policy using the definition of 𝜋 𝛽 𝜃.
+    𝜋𝛽𝜃(𝑦|𝑥) = (𝜋𝜃(𝑦|𝑥))^(1-𝛽) * (𝜇(𝑦|𝑥))^𝛽
+    log 𝜋𝛽𝜃(𝑦|𝑥) = (1 − 𝛽) log(𝜋𝜃(𝑦|𝑥)) + 𝛽 log(𝜇(𝑦|𝑥)) + 𝑐(𝑥)
+
+    Now, the KL divergence between 𝜋𝜃 and 𝜋𝛽𝜃 can be derived as follows:
+
+    KL(𝜋𝜃, 𝜋𝛽𝜃) = ∑𝑦 𝜋𝜃(𝑦|𝑥) log(𝜋𝜃(𝑦|𝑥) / 𝜋𝛽𝜃(𝑦|𝑥))
+    = ∑𝑦 𝜋𝜃(𝑦|𝑥) [log 𝜋𝜃(𝑦|𝑥) - log 𝜋𝛽𝜃(𝑦|𝑥)]
+    = ∑𝑦 𝜋𝜃(𝑦|𝑥) [log 𝜋𝜃(𝑦|𝑥) - ((1-𝛽) log 𝜋𝜃(𝑦|𝑥) + 𝛽 log 𝜇(𝑦|𝑥) - log Z)]
+    = 𝛽 ∑𝑦 𝜋𝜃(𝑦|𝑥) [log 𝜋𝜃(𝑦|𝑥) - log 𝜇(𝑦|𝑥)] + log Z
+    = 𝛽 KL(𝜋𝜃, 𝜇) + log Z
+
+    where Z = ∑𝑦 (𝜋𝜃(𝑦|𝑥))^(1-𝛽) * (𝜇(𝑦|𝑥))^𝛽 is the normalizing constant.
+
+    Therefore, we have:
+
+    ∇𝜃 KL(𝜋𝜃, 𝜋𝛽𝜃) = 𝛽 ∇𝜃 KL(𝜋𝜃, 𝜇)
+
+    This shows that regularizing with respect to the mixture 𝜋𝛽𝜃 (in Nash-MD) is equivalent to regularizing w.r.t. 𝜇 (in Nash-MD-PG), 
+    since a single gradient descent step is performed before updating 𝜋𝜃.
+
     Credit: Claude-3-Opus-200k
     """
     preference_sum = torch.sum((pi_mu_t - pi) * current_preference, dim=-1)  # sum over actions
