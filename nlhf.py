@@ -438,8 +438,8 @@ def preference_model(state, state_action_a, state_action_b, mask_a, mask_b,
     current_preference_loss = torch.mean(((human_preferences - baseline - tau * current_kl_estimator_a) * current_loss_a +
                                  ((1 - human_preferences) - baseline - tau * current_kl_estimator_b) * current_loss_b) / 2)
 
-    current_preference = torch.mean(((human_preferences - baseline - tau * current_kl_estimator_a) + \
-                                    ((1 - human_preferences) - baseline - tau * current_kl_estimator_b)) / 2)
+    current_preference = ((human_preferences - baseline - tau * current_kl_estimator_a) + \
+                            ((1 - human_preferences) - baseline - tau * current_kl_estimator_b)) / 2
 
 
     # Calculate the alternative policy 𝜋′ for state-action pairs (a) and (b) using equation (11)
@@ -458,8 +458,8 @@ def preference_model(state, state_action_a, state_action_b, mask_a, mask_b,
     # KL divergence regularization term helps to prevent the alternative policy
     # from diverging too much from the reference policy during the optimization
     # kl_regularization is proportional to torch.log(alternative_policy_prob / reference_policy_prob)
-    alternative_kl_divergence_a = log_alternative_prob_a - log_reference_prob_a
-    alternative_kl_divergence_b = log_alternative_prob_b - log_reference_prob_b
+    alternative_kl_divergence_a = log_current_prob_a - log_alternative_prob_a
+    alternative_kl_divergence_b = log_current_prob_b - log_alternative_prob_b
 
     # Initialize the gradient term for the alternative policy 𝜋′ using equation (9)
     # alternative_gradient_term_a = torch.zeros_like(log_alternative_prob_a)
@@ -499,10 +499,13 @@ def preference_model(state, state_action_a, state_action_b, mask_a, mask_b,
     alternative_preference_loss = torch.mean(((human_preferences - baseline - tau * alternative_kl_estimator_a) * alternative_loss_a +
                                              ((1 - human_preferences) - baseline - tau * alternative_kl_estimator_b) * alternative_loss_b) / 2)
 
-    # assert current_preference_loss.max() <= 1
-    # assert alternative_preference_loss.max() <= 1
+    alternative_preference = ((human_preferences - baseline - tau * alternative_kl_estimator_a) + \
+                                ((1 - human_preferences) - baseline - tau * alternative_kl_estimator_b)) / 2
+    
+    assert torch.all(current_preference <= baseline)
+    assert torch.all(alternative_preference <= baseline)
 
-    return current_preference_loss, alternative_preference_loss, current_preference
+    return current_preference_loss, alternative_preference_loss, current_preference, alternative_preference
 
 
 # Dataset selection
@@ -1222,7 +1225,7 @@ reflects the nuances of human preferences as captured in the dataset.
 
 Credit: GPT4
 """
-def test_lemma2(pi, pi_t_plus_1, pi_mu_t, eta, current_preference):
+def test_lemma2(pi, pi_t_plus_1, pi_mu_t, eta, alternative_preference):
     """
     Validate the inequality stated in Lemma 2 Equation (14) of the NLHF paper.
     We do not use the final expression of Lemma 2 because it is not directly
@@ -1238,7 +1241,8 @@ def test_lemma2(pi, pi_t_plus_1, pi_mu_t, eta, current_preference):
     - pi_t_plus_1: Torch tensor, the policy at time t+1.
     - pi_mu_t: Torch tensor, the alternative mixture policy at time t.
     - eta: float, the learning rate or step size.
-    - current_preference: Torch tensor, the preference probabilities P(y > 𝜋𝛽𝜃) for all y.
+    - alternative_preference: Torch tensor, the alternative_preference probabilities P(y > 𝜋𝛽𝜃) for all y.
+    - current_preference: Torch tensor, the current_preference probabilities P(y > 𝜇) for all y.
                           See section 7.3 on why we can replace P(y > 𝜋𝛽𝜃) with P(y > 𝜇)
     """
 
@@ -1354,7 +1358,7 @@ def test_lemma2(pi, pi_t_plus_1, pi_mu_t, eta, current_preference):
 
     Credit: Claude-3-Opus-200k
     """
-    preference_sum = torch.sum((pi_mu_t - pi) * current_preference, dim=-1)  # sum over actions
+    preference_sum = torch.sum((pi_mu_t - pi) * alternative_preference, dim=-1)  # sum over actions
 
     # Compute the RHS of the inequality
     rhs = KL_pi_pi_mu_t + eta * preference_sum + 2 * eta**2
@@ -1557,7 +1561,7 @@ for epoch in tqdm(range(num_epochs)):  # loop over the dataset multiple times
             test_lemma1(current_policy_probs, alternative_policy_probs, reference_policy_probs, eta=lr, tau=tau)
 
             # Calculate the preference losses
-            current_preference_loss, alternative_preference_loss, current_preference = preference_model(
+            current_preference_loss, alternative_preference_loss, current_preference, alternative_preference = preference_model(
                                    state,
                                    current_state_action,  # state_action_a,
                                    alternative_state_action,  # state_action_b,
@@ -1572,14 +1576,14 @@ for epoch in tqdm(range(num_epochs)):  # loop over the dataset multiple times
             # For now, Lemma 2 test only passes using a specific policy 𝜋 = 𝜋_(t-1)
             # We should test Lemma 2 for all different kinds of policy 𝜋 , as suggested in equation (14) description
             test_lemma2(pi=current_policy_probs_previous_step, pi_t_plus_1=current_policy_probs,
-                        pi_mu_t=alternative_policy_probs_previous_step, eta=lr, current_preference=current_preference)
+                        pi_mu_t=alternative_policy_probs_previous_step, eta=lr, alternative_preference=alternative_preference)
 
             # Calculate the combined loss for the current token by linearly combining the
             # preference losses for both the current policy and the alternative policy
             token_combined_loss = alpha * current_preference_loss + (1 - alpha) * alternative_preference_loss
 
             # Accumulate the combined loss for the current token
-            combined_loss += token_combined_loss
+            combined_loss += alternative_preference_loss #token_combined_loss
 
             # Update the previous policy probabilities for the next token generation step
             current_policy_probs_previous_step = current_policy_probs
