@@ -429,17 +429,22 @@ def preference_model(state, state_action_a, state_action_b, mask_a, mask_b,
     It encourages the policy to stay close to the reference policy
     for the state-action pair.
     '''
+    # for Stanford SHP dataset, it is 0.5 because human preference label is either 0 or 1
     baseline = 0.5
 
     # Calculate the preference loss using the cross-entropy losses as well as
     # the expectation over states and actions using equation (10)
+    # We remove `baseline` from both `preference_loss` and `preference` as follows because
+    # the mean or average of `human_preferences` and `(1 - human_preferences)` which gives 1/2
+    # already emulates the effect of subtracting `baseline = 1/2`
+
     # preference_loss = torch.mean(((human_preferences - baseline - tau * current_kl_estimator_a) * current_gradient_term_a +
     #                              ((1 - human_preferences) - baseline - tau * current_kl_estimator_b) * current_gradient_term_b)) / 2)
-    current_preference_loss = torch.mean(((human_preferences - baseline - tau * current_kl_estimator_a) * current_loss_a +
-                                 ((1 - human_preferences) - baseline - tau * current_kl_estimator_b) * current_loss_b) / 2)
+    current_preference_loss = torch.mean(((human_preferences - tau * current_kl_estimator_a) * current_loss_a +
+                                 ((1 - human_preferences) - tau * current_kl_estimator_b) * current_loss_b) / 2)
 
-    current_preference = ((human_preferences - baseline - tau * current_kl_estimator_a) + \
-                            ((1 - human_preferences) - baseline - tau * current_kl_estimator_b)) / 2
+    current_preference = ((human_preferences - tau * current_kl_estimator_a) + \
+                            ((1 - human_preferences) - tau * current_kl_estimator_b)) / 2
 
 
     # Calculate the alternative policy 𝜋′ for state-action pairs (a) and (b) using equation (11)
@@ -494,16 +499,20 @@ def preference_model(state, state_action_a, state_action_b, mask_a, mask_b,
 
     # Calculate the preference loss using the cross-entropy losses as well as
     # the expectation over states and actions using equation (10)
+    # We remove `baseline` from both `preference_loss` and `preference` as follows because
+    # the mean or average of `human_preferences` and `(1 - human_preferences)` which gives 1/2
+    # already emulates the effect of subtracting `baseline = 1/2`
+
     # alternative_preference_loss = torch.mean(((human_preferences - baseline - tau * alternative_kl_estimator_a) * alternative_gradient_term_a +
     #                                          ((1 - human_preferences) - baseline - tau * alternative_kl_estimator_b) * alternative_gradient_term_b)) / 2)
-    alternative_preference_loss = torch.mean(((human_preferences - baseline - tau * alternative_kl_estimator_a) * alternative_loss_a +
-                                             ((1 - human_preferences) - baseline - tau * alternative_kl_estimator_b) * alternative_loss_b) / 2)
+    alternative_preference_loss = torch.mean(((human_preferences - tau * alternative_kl_estimator_a) * alternative_loss_a +
+                                             ((1 - human_preferences) - tau * alternative_kl_estimator_b) * alternative_loss_b) / 2)
 
-    alternative_preference = ((human_preferences - baseline - tau * alternative_kl_estimator_a) + \
-                                ((1 - human_preferences) - baseline - tau * alternative_kl_estimator_b)) / 2
+    alternative_preference = ((human_preferences - tau * alternative_kl_estimator_a) + \
+                                ((1 - human_preferences) - tau * alternative_kl_estimator_b)) / 2
     
-    assert torch.all(current_preference <= baseline)
-    assert torch.all(alternative_preference <= baseline)
+    assert torch.all(current_preference <= 1)
+    assert torch.all(alternative_preference <= 1)
 
     return current_preference_loss, alternative_preference_loss, current_preference, alternative_preference
 
@@ -597,7 +606,7 @@ elif USE_NLP:
     from datasets import load_dataset
     from transformers import AutoTokenizer
 
-    # Load all the data
+    # Load all the data from https://huggingface.co/datasets/stanfordnlp/SHP
     # dataset = load_dataset("stanfordnlp/shp")
 
     # Load one of the subreddits
@@ -1573,8 +1582,9 @@ for epoch in tqdm(range(num_epochs)):  # loop over the dataset multiple times
                                )
 
             # Test Lemma 2 of the NLHF paper
-            # For now, Lemma 2 test only passes using a specific policy 𝜋 = 𝜋_(t-1)
-            # We should test Lemma 2 for all different kinds of policy 𝜋 , as suggested in equation (14) description
+            # We should test Lemma 2 for all different kinds of policy 𝜋 , as suggested in equation (14) description.
+            # Previously, Lemma 2 test only passes using a specific policy 𝜋 = 𝜋_(t-1) , 
+            # now removing `baseline` from the logic of `alternative_preference` resolved the issue of Lemma 2 test failure.
             test_lemma2(pi=current_policy_probs_previous_step, pi_t_plus_1=current_policy_probs,
                         pi_mu_t=alternative_policy_probs_previous_step, eta=lr, alternative_preference=alternative_preference)
 
