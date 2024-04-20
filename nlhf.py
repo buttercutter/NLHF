@@ -15,6 +15,8 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau, StepLR, LambdaLR
 from tqdm import tqdm
 
 
+##########################################################################################
+
 USE_ATARI = 0
 USE_NLP = ~USE_ATARI
 
@@ -25,8 +27,13 @@ if USE_NLP:
     USE_SEQ2SEQ_LM = 0
     USE_MAMBA = 0
 
-USE_ADAMW_ON_LION = 1
+USE_ADAMW_ON_LION = 0
 USE_ADAMW = ~USE_ADAMW_ON_LION
+
+USE_IPO_MD = 0
+USE_NLHF = ~USE_IPO_MD
+
+##########################################################################################
 
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -55,14 +62,25 @@ def print_tensor_info(tensor_name, tensor):
         print(f"{key}: {value}")
 
 
+# learning rate
+# result is the best with beta=3e-5 according to Appendix B.3 of IPO-MD paper
+if USE_IPO_MD:
+    lr = 1e-4
+elif USE_NLHF:
+    lr = 3e-5
+
 # Adjusting beta affects the balance between exploiting the current policy
 # and exploring new policies suggested by the reference model or feedback.
 # result is the best with beta=0.125 according to Appendix B.3 of IPO-MD paper
 beta = 0.125
 
-# temperature coefficient, independent of beta parameter above used for mixture
+# temperature parameter controlling degree of kl regularisation towards π_ref,
+# independent of beta parameter above used for mixture
 # result is the best with tau=0.008 according to Appendix B.3 of IPO-MD paper
-tau = 0.008
+if USE_IPO_MD:
+    tau = 1.0
+elif USE_NLHF:
+    tau = 0.008
 
 # alpha is the weight on how to linearly combine the preference losses
 alpha = 0.5
@@ -135,7 +153,7 @@ elif USE_NLP:
         def __init__(self, state_dim):
             super(PolicyNetwork, self).__init__()
             self.bert = bert_model
-            self.final_layer = nn.Linear(self.bert.config.hidden_size, 1)
+            self.final_layer = nn.Linear(self.bert.config.hidden_size, num_actions)
             self.dropout = nn.Dropout(0.2)  # Add dropout
             self.relu = nn.ReLU()
 
@@ -177,13 +195,13 @@ elif USE_NLP:
                 text_embeddings = intermediate_layer(text_embeddings)
 
             # Combine and score
-            score = self.final_layer(text_embeddings)
+            possible_next_tokens = self.final_layer(text_embeddings)
 
-            # for numerical stability
-            # score = self.relu(score) + 1e-6
-            score = torch.sigmoid(score)
+            # for sampling next token y_n distributions (implemented as a softmax over logits)
+            # See section 7.1 of NLHF paper for more details
+            possible_next_tokens = torch.softmax(possible_next_tokens, dim=-1)
 
-            return score
+            return possible_next_tokens
 
 
 """
@@ -215,10 +233,10 @@ See also expression (1.1), section 4 and Theorem 1 of
 
 def alternative_policy(current_policy_probs, reference_policy_probs):
     # Calculate the alternative policy 𝜋′ using equation (11)
-    log_alternative_policy_prob = (1 - beta) * torch.log(current_policy_probs) + \
+    log_alternative_policy_probs = (1 - beta) * torch.log(current_policy_probs) + \
                                 beta * torch.log(reference_policy_probs)
 
-    alternative_policy_prob = torch.exp(log_alternative_policy_prob)
+    alternative_policy_probs = torch.exp(log_alternative_policy_probs)
 
     """
     See section 7 of the paper
@@ -231,7 +249,7 @@ def alternative_policy(current_policy_probs, reference_policy_probs):
     sum of probabilities across all possible actions y equals 1.
     """
     # Normalize the alternative policy 𝜋′ using equation (11)
-    alternative_policy_prob = alternative_policy_prob / alternative_policy_prob.sum(dim=-1, keepdim=True)
+    alternative_policy_probs = alternative_policy_probs / alternative_policy_probs.sum(dim=-1, keepdim=True)
 
     """
     The following needs some pondering and may need to be revisited.
@@ -245,10 +263,10 @@ def alternative_policy(current_policy_probs, reference_policy_probs):
     Credit: Quoted directly from section 7.1 of NLHF paper
     """
 
-    assert alternative_policy_prob >= 0
-    assert alternative_policy_prob <= 1
+    assert torch.all(alternative_policy_probs >= 0)
+    assert torch.all(alternative_policy_probs <= 1)
 
-    return alternative_policy_prob
+    return alternative_policy_probs
 
 
 def preference_model(state, state_action_a, state_action_b, mask_a, mask_b,
@@ -386,7 +404,7 @@ def preference_model(state, state_action_a, state_action_b, mask_a, mask_b,
     so when a value of 1 indicates a preference for state-action pair (b),
     a value of 0 would indicate a preference for state-action pair (a).
 
-    baseline = 0.5 is subtracted to center the preference around 0
+    baseline = 0.5 is subtracted to center the preference around the middle.
     Subtract the baseline (average preference score) for variance reduction
     to reduce the variance of the policy gradient estimate, which can help
     stabilize training
@@ -394,7 +412,7 @@ def preference_model(state, state_action_a, state_action_b, mask_a, mask_b,
 
     There is also another reason for using baseline = 0.5, see
     proposition D.1 in the IPO-MD paper:
- 
+
     p(y ≻ y′) = 1 - p(y′ ≻ y) for all y, y′ ∈ Y
     f(y, y′) := p(y ≻ y′) - 1/2 - τ log(π(y)/π_ref(y)) + τ log(π(y′)/π_ref(y′))
 
@@ -411,14 +429,22 @@ def preference_model(state, state_action_a, state_action_b, mask_a, mask_b,
     It encourages the policy to stay close to the reference policy
     for the state-action pair.
     '''
+    # for Stanford SHP dataset, it is 0.5 because human preference label is either 0 or 1
     baseline = 0.5
 
     # Calculate the preference loss using the cross-entropy losses as well as
     # the expectation over states and actions using equation (10)
+    # We remove `baseline` from both `preference_loss` and `preference` as follows because
+    # the mean or average of `human_preferences` and `(1 - human_preferences)` which gives 1/2
+    # already emulates the effect of subtracting `baseline = 1/2`
+
     # preference_loss = torch.mean(((human_preferences - baseline - tau * current_kl_estimator_a) * current_gradient_term_a +
     #                              ((1 - human_preferences) - baseline - tau * current_kl_estimator_b) * current_gradient_term_b)) / 2)
-    current_preference_loss = torch.mean(((human_preferences - baseline - tau * current_kl_estimator_a) * current_loss_a +
-                                 ((1 - human_preferences) - baseline - tau * current_kl_estimator_b) * current_loss_b) / 2)
+    current_preference_loss = torch.mean(((human_preferences - tau * current_kl_estimator_a) * current_loss_a +
+                                 ((1 - human_preferences) - tau * current_kl_estimator_b) * current_loss_b) / 2)
+
+    current_preference = ((human_preferences - tau * current_kl_estimator_a) + \
+                            ((1 - human_preferences) - tau * current_kl_estimator_b)) / 2
 
 
     # Calculate the alternative policy 𝜋′ for state-action pairs (a) and (b) using equation (11)
@@ -437,8 +463,8 @@ def preference_model(state, state_action_a, state_action_b, mask_a, mask_b,
     # KL divergence regularization term helps to prevent the alternative policy
     # from diverging too much from the reference policy during the optimization
     # kl_regularization is proportional to torch.log(alternative_policy_prob / reference_policy_prob)
-    alternative_kl_divergence_a = log_alternative_prob_a - log_reference_prob_a
-    alternative_kl_divergence_b = log_alternative_prob_b - log_reference_prob_b
+    alternative_kl_divergence_a = log_current_prob_a - log_alternative_prob_a
+    alternative_kl_divergence_b = log_current_prob_b - log_alternative_prob_b
 
     # Initialize the gradient term for the alternative policy 𝜋′ using equation (9)
     # alternative_gradient_term_a = torch.zeros_like(log_alternative_prob_a)
@@ -473,15 +499,22 @@ def preference_model(state, state_action_a, state_action_b, mask_a, mask_b,
 
     # Calculate the preference loss using the cross-entropy losses as well as
     # the expectation over states and actions using equation (10)
+    # We remove `baseline` from both `preference_loss` and `preference` as follows because
+    # the mean or average of `human_preferences` and `(1 - human_preferences)` which gives 1/2
+    # already emulates the effect of subtracting `baseline = 1/2`
+
     # alternative_preference_loss = torch.mean(((human_preferences - baseline - tau * alternative_kl_estimator_a) * alternative_gradient_term_a +
     #                                          ((1 - human_preferences) - baseline - tau * alternative_kl_estimator_b) * alternative_gradient_term_b)) / 2)
-    alternative_preference_loss = torch.mean(((human_preferences - baseline - tau * alternative_kl_estimator_a) * alternative_loss_a +
-                                             ((1 - human_preferences) - baseline - tau * alternative_kl_estimator_b) * alternative_loss_b) / 2)
+    alternative_preference_loss = torch.mean(((human_preferences - tau * alternative_kl_estimator_a) * alternative_loss_a +
+                                             ((1 - human_preferences) - tau * alternative_kl_estimator_b) * alternative_loss_b) / 2)
 
-    assert current_preference_loss.max() <= 1
-    assert alternative_preference_loss.max() <= 1
+    alternative_preference = ((human_preferences - tau * alternative_kl_estimator_a) + \
+                                ((1 - human_preferences) - tau * alternative_kl_estimator_b)) / 2
+    
+    assert torch.all(current_preference <= 1)
+    assert torch.all(alternative_preference <= 1)
 
-    return current_preference_loss, alternative_preference_loss
+    return current_preference_loss, alternative_preference_loss, current_preference, alternative_preference
 
 
 # Dataset selection
@@ -573,7 +606,7 @@ elif USE_NLP:
     from datasets import load_dataset
     from transformers import AutoTokenizer
 
-    # Load all the data
+    # Load all the data from https://huggingface.co/datasets/stanfordnlp/SHP
     # dataset = load_dataset("stanfordnlp/shp")
 
     # Load one of the subreddits
@@ -663,7 +696,10 @@ elif USE_NLP:
 # Quoted from [IPO-MD paper](http://arxiv.org/abs/2403.08635):
 # Nash-MD-PG is on-policy, in that the only gradient contributions appearing in
 # its update are those corresponding to actions sampled under the current policy.
-reference_policy.eval()
+if USE_IPO_MD:
+    current_policy.eval()
+elif USE_NLHF:
+    reference_policy.eval()
 
 # Extracting token IDs for state, action_a and action_b
 state_ids = state['input_ids']
@@ -1021,21 +1057,16 @@ if USE_ADAMW_ON_LION:
 
     optimizer_current_policy = AdamW_on_Lion_Optimizer(
                                     params=current_policy.parameters(),
-                                    lr=3e-5,
-                                    adam_betas=(0.9, 0.999),
-                                    lion_betas=(0.9, 0.999),
-                                    eps=1e-8,
-                                    weight_decay=0
+                                    lr=lr
                                )
     optimizer_reference_policy = AdamW_on_Lion_Optimizer(
                                     params=reference_policy.parameters(),
-                                    lr=3e-5
+                                    lr=lr
                                  )
 
 elif USE_ADAMW:
-    optimizer_current_policy = optim.AdamW(current_policy.parameters(), lr=1e-3)
-    optimizer_reference_policy = optim.AdamW(reference_policy.parameters(),
-                                             lr=1e-3)
+    optimizer_current_policy = optim.AdamW(current_policy.parameters(), lr=lr)
+    optimizer_reference_policy = optim.AdamW(reference_policy.parameters(), lr=lr)
 
 
 """
@@ -1087,7 +1118,33 @@ as long as the KL divergences can be computed.
 Credit: Claude-3-Opus-200k
 """
 
-def lemma1(pi_t, pi_mu_t, mu, eta=3e-5, tau=tau):
+# Compute step by step the KL divergence between two distributions (pi_1 and pi_2),
+# with only single action or token at any compute cycle
+def compute_kl_divergence(pi_1, pi_2):
+    # Removes the unnessary dimension due to tokenizer() function
+    # because torch.distributions.kl_divergence() needs more than 1 dimension
+    pi_1 = pi_1.squeeze(0)
+    pi_2 = pi_2.squeeze(0)
+
+    # print(f"pi_1.shape = {pi_1.shape}, pi_2.shape = {pi_2.shape}, \
+    #       num_actions = {num_actions}")
+
+    kl_divergence = torch.distributions.kl_divergence(
+        torch.distributions.Categorical(probs=pi_1),
+        torch.distributions.Categorical(probs=pi_2)
+    )
+    return kl_divergence
+
+# Generate a random policy 𝜋 for testing
+def generate_random_policy(num_actions):
+    # Generate a random tensor of probabilities for each action
+    # at each step or sequence slot
+    policy_probs = torch.rand((1, num_actions))
+    # Softmax distribution required in section 7.1 of NLHF paper
+    policy_probs = torch.softmax(policy_probs, dim=-1)
+    return policy_probs
+    
+def test_lemma1(pi_t, pi_mu_t, mu, eta=3e-5, tau=tau):
     """
     This function asserts the inequality from Lemma 1 in the NLHF paper
 
@@ -1096,56 +1153,229 @@ def lemma1(pi_t, pi_mu_t, mu, eta=3e-5, tau=tau):
     mu: reference policy
     eta: learning rate, scalar value between 0 and 1
     tau: regularization coefficient, scalar value between 0 and 1
+    sequence_length: length of the sequence
     """
 
-    # Generate a random policy 𝜋 for testing
-    def generate_random_policy(num_actions):
-        # Generate a random vector of probabilities
-        policy_probs = torch.rand(num_actions)
-        # Normalize to make it a valid probability distribution
-        policy_probs /= policy_probs.sum()
-        # Sample a random action from the policy
-        random_integer = random.randint(0, num_actions-1)
-        return policy_probs[random_integer]
-
+    # Generates probability distribution for all different possible tokens
+    # at each step or sequence slot
     pi = generate_random_policy(num_actions)  # Arbitrary policy 𝜋
 
-    # Print out the policy to see the value
+    # Print out the policy to see the values
     # print(f"Arbitrary policy pi: {pi}")
 
-    # Compute the KL divergences
-    # kl_pi_mu = torch.distributions.kl_divergence(pi, mu)
-    # kl_pi_pi_t = torch.distributions.kl_divergence(pi, pi_t)
-    # kl_pi_mu_t_mu = torch.distributions.kl_divergence(pi_mu_t, mu)
 
-    # Compute the KL divergences manually since the distributions are not defined
-    kl_pi_mu = pi * torch.log(pi / mu)
-    kl_pi_pi_t = pi * torch.log(pi / pi_t)
-    kl_pi_mu_t_mu = pi_mu_t * torch.log(pi_mu_t / mu)
+    # Compute the KL divergences
+    kl_pi_mu = compute_kl_divergence(pi, mu)
+    kl_pi_pi_t = compute_kl_divergence(pi, pi_t)
+    kl_pi_mu_t_mu = compute_kl_divergence(pi_mu_t, mu)
 
     # Calculate the right side of the inequality
     rhs = eta * tau * kl_pi_mu + (1 - eta * tau) * kl_pi_pi_t - eta * tau * kl_pi_mu_t_mu
 
     # Assert the inequality from Lemma 1
-    assert pi * torch.log(pi / pi_mu_t) <= rhs, "Lemma 1 inequality does not hold"
+    assert compute_kl_divergence(pi, pi_mu_t) <= rhs, \
+        "Lemma 1 inequality does not hold"
 
     return True  # If Lemma 1 passes, return True
 
 
-# Please see Theorem 1 inside the NLHF paper
-def theorem1_eq6(pi_star_tau, pi_t, pi_t_plus_1, eta, tau):
+# Please see Lemma 2 inside the NLHF paper
+"""
+Given the Stanford Human Preferences (SHP) dataset's nature, which typically
+contains comparative preference data (e.g., user preferences between pairs of
+options rather than explicit probabilities), and fixed probabilities are not 
+directly provided. Therefore, the most suitable approach is dynamically computing 
+preferences based on the context and current policy evaluations.
+
+### Why Dynamic Preference Modeling Fits SHP Data:
+
+1. **Relative Preferences**:
+   - The SHP dataset usually includes paired comparisons (e.g., "Is option A
+   better than option B?"). These can be used to infer relative strengths or
+   preferences but do not directly give the probability P(y > pi_mu_t)
+   for action y over a policy pi_mu_t.
+
+2. **Learning from Feedback**:
+   - Preferences can be modeled using a function that interprets the outcomes of
+   these comparisons. For instance, a neural network or a logistic regression model
+   that inputs features of y and pi_mu_t and outputs the likelihood of y being preferred.
+   This model adapts and improves as it learns from more data.
+
+3. **Adaptability**:
+   - Dynamically computed preferences allow the system to adapt to new data and
+   potentially changing user preferences, which is crucial in real-world applications
+   like recommendation systems where user preferences aren't static.
+
+### Implementing a Dynamic Preference Model
+
+Given the paired nature of data in SHP, here's how we could set up a dynamic
+preference computation:
+
+1. **Model Definition**:
+   - Define a model that predicts the preference probability between two given options.
+   This could be a logistic regression model or a neural network.
+
+2. **Training the Model**:
+   - Use the paired comparisons to train this model. For each pair (A, B) and a
+   user preference P(A > B), the model learns to predict the likelihood of
+   preference for one option over the other.
+
+3. **Using the Model for Policy Evaluation**:
+   - When evaluating P(y > pi_mu_t), use the trained model to compute the
+   preference probability of each action y over the actions suggested by pi_mu_t.
+
+
+### Conclusion
+Using a dynamic preference model is particularly beneficial for datasets like SHP,
+where preferences are context-dependent and relative. This approach is more flexible
+and generally more robust to changes in data distribution or user behavior over time.
+The key is to ensure that the preference model is well-calibrated and accurately
+reflects the nuances of human preferences as captured in the dataset.
+
+Credit: GPT4
+"""
+def test_lemma2(pi, pi_t_plus_1, pi_mu_t, eta, alternative_preference):
+    """
+    Validate the inequality stated in Lemma 2 Equation (14) of the NLHF paper.
+    We do not use the final expression of Lemma 2 because it is not directly
+    expressible in code, given that the Nash policy (𝜋∗𝜏) is not feasible to obtain
+    for all different kinds of downstream tasks.
+
+    Instead, we use intermediate step which is equation (14) to validate Lemma 2.
+    The final expression of Lemma 2 makes use of Lemma 1, but since we had already
+    tested Lemma 1 above, we can directly use the intermediate step of Lemma 2.
+
+    Args:
+    - pi: Torch tensor, any policies.
+    - pi_t_plus_1: Torch tensor, the policy at time t+1.
+    - pi_mu_t: Torch tensor, the alternative mixture policy at time t.
+    - eta: float, the learning rate or step size.
+    - alternative_preference: Torch tensor, the alternative_preference probabilities P(y > 𝜋𝛽𝜃) for all y.
+    - current_preference: Torch tensor, the current_preference probabilities P(y > 𝜇) for all y.
+                          See section 7.3 on why we can replace P(y > 𝜋𝛽𝜃) with P(y > 𝜇)
+    """
+
+    if pi_mu_t is None:
+        # t=0, just started token generation of the very first token, and there is no policy yet for
+        # the KL divergence comparison between timestep = t and t+1, so no meaningful testing result
+        # given that we are feeding in "previous" mixture_policy and "current" policy as pi_mu_t and 
+        # pi_t_plus_1 respectively
+        print("At initial timestep, no policies available for comparison. Skipping Lemma 2 test...")
+        return True  # If policies are None, return True
+
+    # Generates probability distribution for all different possible tokens
+    # at each step or sequence slot
+    pi = generate_random_policy(num_actions)  # Arbitrary policy 𝜋
+
     # Compute the KL divergences
-    kl_pi_star_tau_pi_t = torch.distributions.kl_divergence(pi_star_tau, pi_t)
-    kl_pi_star_tau_pi_t_plus_1 = torch.distributions.kl_divergence(pi_star_tau, pi_t_plus_1)
+    KL_pi_pi_t_plus_1 = compute_kl_divergence(pi, pi_t_plus_1)
+    KL_pi_pi_mu_t = compute_kl_divergence(pi, pi_mu_t)
 
-    # Assert the inequality from Theorem 1 (equation 6)
-    assert torch.allclose(
-        kl_pi_star_tau_pi_t_plus_1,
-        (1 - eta * tau) * kl_pi_star_tau_pi_t + 2 * eta**2,
-        atol=1e-5,  # Adjust the tolerance as needed
-    ), "Theorem 1 (equation 6) inequality does not hold"
+    # Calculate the preference sum
+    """
+    In equation (14), P(𝑦 ≻ 𝜋𝜇𝑡) represents the preference of action 𝑦 over the regularized policy 𝜋𝜇𝑡.
+    This notation is defined earlier in the paper in Section 3, where P(𝑦 ≻ 𝜋′|𝑥) = 𝔼𝑦′∼𝜋′(·|𝑥)[P(𝑦 ≻ 𝑦′|𝑥)]
+    is the preference of an action 𝑦 over a policy 𝜋′ conditioned on context 𝑥.
 
-    return True  # If Theorem 1 passes, return True
+    The contextual bandit setup described at the end of Section 6 is the most relevant here.
+    It defines the Nash-MD algorithm for the contextual case, where for every 𝑥 ∈ supp(𝜌):
+
+    𝜋𝑡+1(·|𝑥) = arg max𝜋(·) [𝜂P(𝜋(·|𝑥) ≻ 𝜋𝜇𝑡(·|𝑥)|𝑥) − KL(𝜋(·), 𝜋𝜇𝑡(·|𝑥))]
+
+    and 𝜋𝜇𝑡(𝑦|𝑥) ∝ 𝜋𝑡(𝑦|𝑥)1−𝜂𝜏𝜇(𝑦|𝑥)𝜂𝜏.
+
+    So in the proof of Theorem 1, when applying Lemma 2 to the contextual case, 𝛿(𝑦) = 𝜂P(𝑦 ≻ 𝜋𝜇𝑡)
+    uses the preference of action 𝑦 over the regularized policy 𝜋𝜇𝑡.
+
+    In contrast, equation (9) describes the policy gradient estimate used in the model-based approach
+    for computing the Nash equilibrium. It uses the reference policy 𝜇(𝑦|𝑥) directly in the KL term,
+    rather than the regularized policy 𝜋𝜇𝑡(𝑦|𝑥).
+
+    Mathematically, equation (9) and the contextual bandit setup are related through the discussion
+    in Section 7.3 comparing Nash-MD and Nash-MD-PG. It's shown there that regularizing with respect
+    to 𝜋𝜇𝑡 (as in Nash-MD) is equivalent to regularizing with respect to 𝜇 (as in Nash-MD-PG), because:
+
+    KL(𝜋𝜃, 𝜋𝛽𝜃) = 𝛽KL(𝜋𝜃, 𝜇) − 𝔼𝑥∼𝜌[𝑐(𝑥)]
+
+    and so ∇𝜃KL(𝜋𝜃, 𝜋𝛽𝜃) = 𝛽∇𝜃KL(𝜋𝜃, 𝜇).
+
+    Since Nash-MD-PG performs a single gradient step before updating 𝜋𝜃, using 𝜋𝛽𝜃 or 𝜇 in the
+    regularization is equivalent. The additional 𝛽 parameter in equation (11) defining 𝜋𝛽𝜃 allows
+    it to be tuned independently of 𝜏 used in equation (9).
+
+    Let's derive the equivalence of using 𝜋𝛽𝜃 or 𝜇 in the regularization term of the policy gradient estimate.
+    In section 7.3 , we have :
+
+    KL(𝜋𝜃, 𝜋 𝛽 𝜃) = (1 − 𝛽)KL(𝜋𝜃, 𝜋𝜃) + 𝛽KL(𝜋𝜃, 𝜇) − 𝔼𝑥∼𝜌 [𝑐(𝑥)] = 𝛽KL(𝜋𝜃, 𝜇) − 𝔼𝑥∼𝜌 [𝑐(𝑥)], 
+    
+    where 𝑐(𝑥) is the normalizing constant in Equation (11). Thus, we have ∇ 𝜃KL(𝜋𝜃, 𝜋 𝛽 𝜃) = 𝛽∇𝜃KL(𝜋𝜃, 𝜇)
+
+    This expression relates the KL divergence between the current policy 𝜋𝜃 and the mixture policy 𝜋 𝛽 𝜃 to 
+    the KL divergence between the current policy 𝜋𝜃 and the reference policy 𝜇. Let's break it down step by step:
+
+    1. KL(𝜋𝜃, 𝜋 𝛽 𝜃) represents the KL divergence between the current policy 𝜋𝜃 and the mixture policy 𝜋 𝛽 𝜃.
+
+    2. The mixture policy 𝜋 𝛽 𝜃 is defined as a geometric mixture of the current policy 𝜋𝜃 and the reference policy 𝜇, 
+    with mixing coefficient 𝛽. Specifically, 𝜋 𝛽 𝜃(𝑦|𝑥) = 𝜋𝜃(𝑦|𝑥)^(1−𝛽) 𝜇(𝑦|𝑥)^𝛽.
+
+    3. The KL divergence between the current policy and the mixture policy can be decomposed into two terms:
+    - (1 − 𝛽)KL(𝜋𝜃, 𝜋𝜃): This term represents the KL divergence between the current policy and itself, which is always zero.
+    - 𝛽KL(𝜋𝜃, 𝜇): This term represents the KL divergence between the current policy and the reference policy, scaled by the mixing coefficient 𝛽.
+
+    4. 𝔼𝑥∼𝜌 [𝑐(𝑥)] represents the expected value of the normalizing constant 𝑐(𝑥) over the state distribution 𝜌. 
+    The normalizing constant 𝑐(𝑥) is used in Equation (11) to ensure that the updated policy probabilities sum up to 1.
+
+    5. By subtracting the expected value of the normalizing constant 𝔼𝑥∼𝜌 [𝑐(𝑥)] from both sides of the equation, we obtain:
+    KL(𝜋𝜃, 𝜋 𝛽 𝜃) = 𝛽KL(𝜋𝜃, 𝜇) − 𝔼𝑥∼𝜌 [𝑐(𝑥)]
+
+    6. Finally, taking the gradient of both sides with respect to the policy parameters 𝜃 yields:
+    ∇ 𝜃KL(𝜋𝜃, 𝜋 𝛽 𝜃) = 𝛽∇𝜃KL(𝜋𝜃, 𝜇)
+
+    This equation states that the gradient of the KL divergence between the current policy and the mixture policy with 
+    respect to the policy parameters is equal to 𝛽 times the gradient of the KL divergence between the current policy and the reference policy.
+
+    The significance of this expression lies in the fact that it establishes a connection between the regularization term 
+    used in Nash-MD (KL(𝜋𝜃, 𝜋 𝛽 𝜃)) and the regularization term used in Nash-MD-PG (KL(𝜋𝜃, 𝜇)). It shows that the gradient of 
+    the KL divergence between the current policy and the mixture policy can be computed using only the gradient of the KL divergence 
+    between the current policy and the reference policy, scaled by the mixing coefficient 𝛽.
+
+    This relationship allows for a simplification of the regularization term in the Nash-MD-PG algorithm, as it can be expressed 
+    solely in terms of the KL divergence between the current policy and the reference policy, without explicitly involving the mixture policy.
+
+    Now, we will derive the maths inside section 7.3 to rigorously prove the above:
+
+    Expand the logarithm of the mixture policy using the definition of 𝜋 𝛽 𝜃.
+    𝜋𝛽𝜃(𝑦|𝑥) = (𝜋𝜃(𝑦|𝑥))^(1-𝛽) * (𝜇(𝑦|𝑥))^𝛽
+    log 𝜋𝛽𝜃(𝑦|𝑥) = (1 − 𝛽) log(𝜋𝜃(𝑦|𝑥)) + 𝛽 log(𝜇(𝑦|𝑥)) + 𝑐(𝑥)
+
+    Now, the KL divergence between 𝜋𝜃 and 𝜋𝛽𝜃 can be derived as follows:
+
+    KL(𝜋𝜃, 𝜋𝛽𝜃) = ∑𝑦 𝜋𝜃(𝑦|𝑥) log(𝜋𝜃(𝑦|𝑥) / 𝜋𝛽𝜃(𝑦|𝑥))
+    = ∑𝑦 𝜋𝜃(𝑦|𝑥) [log 𝜋𝜃(𝑦|𝑥) - log 𝜋𝛽𝜃(𝑦|𝑥)]
+    = ∑𝑦 𝜋𝜃(𝑦|𝑥) [log 𝜋𝜃(𝑦|𝑥) - ((1-𝛽) log 𝜋𝜃(𝑦|𝑥) + 𝛽 log 𝜇(𝑦|𝑥) - log Z)]
+    = 𝛽 ∑𝑦 𝜋𝜃(𝑦|𝑥) [log 𝜋𝜃(𝑦|𝑥) - log 𝜇(𝑦|𝑥)] + log Z
+    = 𝛽 KL(𝜋𝜃, 𝜇) + log Z
+
+    where Z = ∑𝑦 (𝜋𝜃(𝑦|𝑥))^(1-𝛽) * (𝜇(𝑦|𝑥))^𝛽 is the normalizing constant.
+
+    Therefore, we have:
+
+    ∇𝜃 KL(𝜋𝜃, 𝜋𝛽𝜃) = 𝛽 ∇𝜃 KL(𝜋𝜃, 𝜇)
+
+    This shows that regularizing with respect to the mixture 𝜋𝛽𝜃 (in Nash-MD) is equivalent to regularizing w.r.t. 𝜇 (in Nash-MD-PG), 
+    since a single gradient descent step is performed before updating 𝜋𝜃.
+
+    Credit: Claude-3-Opus-200k
+    """
+    preference_sum = torch.sum((pi_mu_t - pi) * alternative_preference, dim=-1)  # sum over actions
+
+    # Compute the RHS of the inequality
+    rhs = KL_pi_pi_mu_t + eta * preference_sum + 2 * eta**2
+
+    # Assert that the KL divergence of pi and pi_t_plus_1 is less than or equal to the calculated RHS
+    assert KL_pi_pi_t_plus_1 <= rhs, "Lemma 2, Equation (14) does not hold."
+
+    return True  # If Lemma 2 passes, return True
 
 
 # Training loop
@@ -1277,10 +1507,10 @@ for epoch in tqdm(range(num_epochs)):  # loop over the dataset multiple times
         """
 
         # Calculate the maximum response length in the batch
-        # Instead of calculating the average response length across the entire dataset, 
+        # Instead of calculating the average response length across the entire dataset,
         # we calculate the maximum response length within the current batch.
-        # We use the mask_a and mask_b tensors to determine the actual length of each response in the batch. 
-        # The mask_a and mask_b tensors have the same shape as state_action_a and state_action_b, respectively, 
+        # We use the mask_a and mask_b tensors to determine the actual length of each response in the batch.
+        # The mask_a and mask_b tensors have the same shape as state_action_a and state_action_b, respectively,
         # with values of 1 indicating valid tokens and 0 indicating padding tokens.
         # By applying sum(dim=1) to mask_a and mask_b, we obtain the actual length of each response in the batch.
         max_response_length = max(mask_a.sum(dim=1).max().item(), mask_b.sum(dim=1).max().item())
@@ -1293,35 +1523,54 @@ for epoch in tqdm(range(num_epochs)):  # loop over the dataset multiple times
         alternative_state_action = state_action_b  # Use state_action_b as the initial state-action pair for the alternative policy
         alternative_response = []
 
+        # Initialize the log marginal mixture tensor and the combined loss
+        log_marginal_mixture = torch.zeros((1, num_actions))
         combined_loss = 0
-        for _ in range(max_response_length):  # Loop over every tokens in the sequence
-            current_policy_prob = current_policy(current_state_action)
-            reference_policy_prob = reference_policy(alternative_state_action)
 
-            assert current_policy_prob >= 0
-            assert current_policy_prob <= 1
-            assert reference_policy_prob >= 0
-            assert reference_policy_prob <= 1
+        # Initialize the previous policy probabilities for verification of the next token generation step
+        current_policy_probs_previous_step = None
+        alternative_policy_probs_previous_step = None
 
-            current_token = torch.multinomial(current_policy_prob, num_samples=1)
+        for t in range(max_response_length):  # Loop over every token slot in the sequence
+            # Obtains the current and reference policies probabilities
+            # for all the possible actions/tokens in that specific slot
+            current_policy_probs = current_policy(current_state_action)
+            reference_policy_probs = reference_policy(alternative_state_action)
+
+            assert torch.all(current_policy_probs >= 0)
+            assert torch.all(current_policy_probs <= 1)
+            assert torch.all(reference_policy_probs >= 0)
+            assert torch.all(reference_policy_probs <= 1)
+
+            # Samples a next token 𝑦𝑛 from the softmax distribution of current_policy
+            # Implements token-per-token "autoregressive" (hence only up to previous t token) generation of responses 𝑦 ∼ 𝜋(·|𝑥)
+            current_token = torch.multinomial(current_policy_probs[:, :t+1], num_samples=1)
             current_response.append(current_token)
-            current_state_action = torch.cat((current_token, current_state_action[:, 1:]), dim=1)
+            # print(f'current_token.size(): {current_token.size()}, current_state_action[:, 1:].size(): {current_state_action[:, 1:].size()}')
+            current_state_action = torch.cat((current_token, current_state_action[:, 1:]), dim=-1)
 
-            log_marginal_mixture = (1 - beta) * torch.log(current_policy_prob) + beta * torch.log(reference_policy_prob)
-            alternative_policy_prob = torch.exp(log_marginal_mixture)
+            # See equation (11) of the NLHF paper
+            # Calculate the marginal geometric mixture of the current policy and the reference policy
+            log_marginal_mixture[:, :t+1] = (1 - beta) * torch.log(current_policy_probs[:, :t+1]) + beta * torch.log(reference_policy_probs[:, :t+1])
+            alternative_policy_probs = torch.exp(log_marginal_mixture)
 
-            assert alternative_policy_prob >= 0
-            assert alternative_policy_prob <= 1
+            assert torch.all(alternative_policy_probs >= 0)
+            assert torch.all(alternative_policy_probs <= 1)
 
-            alternative_token = torch.multinomial(alternative_policy_prob, num_samples=1)
+            # Samples a next token 𝑦𝑛 from the softmax distribution of alternative_policy
+            alternative_token = torch.multinomial(alternative_policy_probs, num_samples=1)
             alternative_response.append(alternative_token)
-            alternative_state_action = torch.cat((alternative_token, alternative_state_action[:, 1:]), dim=1)
+            # print(f'alternative_token.size(): {alternative_token.size()}, alternative_state_action[:, 1:].size(): {alternative_state_action[:, 1:].size()}')
+            alternative_state_action = torch.cat((alternative_token, alternative_state_action[:, 1:]), dim=-1)
 
             # Test Lemma 1 of the NLHF paper
-            # lemma1(current_policy_prob, alternative_policy_prob, reference_policy_prob, eta=3e-5, tau=tau)
+            # print(f"current_policy_probs.shape = {current_policy_probs.shape}, \
+            #        reference_policy_probs.shape = {reference_policy_probs.shape}, \
+            #        alternative_policy_probs.shape = {alternative_policy_probs.shape}")
+            test_lemma1(current_policy_probs, alternative_policy_probs, reference_policy_probs, eta=lr, tau=tau)
 
             # Calculate the preference losses
-            current_preference_loss, alternative_preference_loss = preference_model(
+            current_preference_loss, alternative_preference_loss, current_preference, alternative_preference = preference_model(
                                    state,
                                    current_state_action,  # state_action_a,
                                    alternative_state_action,  # state_action_b,
@@ -1332,12 +1581,23 @@ for epoch in tqdm(range(num_epochs)):  # loop over the dataset multiple times
                                    human_preferences
                                )
 
+            # Test Lemma 2 of the NLHF paper
+            # We should test Lemma 2 for all different kinds of policy 𝜋 , as suggested in equation (14) description.
+            # Previously, Lemma 2 test only passes using a specific policy 𝜋 = 𝜋_(t-1) , 
+            # now removing `baseline` from the logic of `alternative_preference` resolved the issue of Lemma 2 test failure.
+            test_lemma2(pi=current_policy_probs_previous_step, pi_t_plus_1=current_policy_probs,
+                        pi_mu_t=alternative_policy_probs_previous_step, eta=lr, alternative_preference=alternative_preference)
+
             # Calculate the combined loss for the current token by linearly combining the
             # preference losses for both the current policy and the alternative policy
             token_combined_loss = alpha * current_preference_loss + (1 - alpha) * alternative_preference_loss
 
             # Accumulate the combined loss for the current token
-            combined_loss += token_combined_loss
+            combined_loss += alternative_preference_loss #token_combined_loss
+
+            # Update the previous policy probabilities for the next token generation step
+            current_policy_probs_previous_step = current_policy_probs
+            alternative_policy_probs_previous_step = alternative_policy_probs
 
         # Calculate the average combined loss across all tokens
         combined_loss /= max_response_length
